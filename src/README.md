@@ -1,5 +1,7 @@
 # Source Code
 
+> **Full dataset (required to run these scripts):** [huggingface.co/datasets/themantralab/gol-emergence-dataset](https://huggingface.co/datasets/themantralab/gol-emergence-dataset)
+
 ## What was used to generate the published dataset
 
 The published dataset was produced by exactly two scripts, run in order:
