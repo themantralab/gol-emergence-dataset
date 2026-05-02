@@ -1,0 +1,24 @@
+# Large array files — host on Hugging Face / Zenodo
+data/grids.npy
+data/signatures_norm.npy
+data/sig_reference.npy
+
+# Intermediate pipeline files
+data/signatures_raw.npy
+data/cluster_labels.npy
+data/cluster_centroids.npy
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
