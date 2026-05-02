@@ -77,10 +77,16 @@ gol-emergence-dataset/
 
 ---
 
-## Large Files (External Hosting)
+## Full Dataset — Hugging Face
 
-The following files exceed GitHub's size limits and are hosted separately.
-Links will be added when the data repository is published on Hugging Face / Zenodo.
+The complete dataset including all large array files is hosted on Hugging Face:
+
+**[huggingface.co/datasets/themantralab/gol-emergence-dataset](https://huggingface.co/datasets/themantralab/gol-emergence-dataset)**
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="themantralab/gol-emergence-dataset", repo_type="dataset", local_dir="./gol-data")
+```
 
 | File | Shape | Size | Description |
 |---|---|---|---|
