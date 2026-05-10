@@ -54,8 +54,13 @@ static appearance or average behavior.
 
 **Encoder**: convolutional network
 - Input: 128×128 binary grid (uint8, treated as float32 in [0,1])
-- Architecture: 4 conv layers with batch norm, stride-2 downsampling
-- Output: z ∈ ℝ¹²⁸ (latent dimension = 128)
+- Channel progression: 1→32→64→128→256, stride-2 at each layer
+  - After 4 stride-2 layers: spatial size 128→64→32→16→8
+  - Flatten: 256×8×8 = 16,384 → linear → 128
+- BatchNorm + ReLU after each conv layer (standard pairing; BN removes the
+  dying-neuron risk that makes ReLU problematic without normalisation)
+- No activation after the final linear → 128; z is raw, VICReg shapes its
+  distribution during training
 - No reparameterization trick, no sampling, purely deterministic
 - BatchNorm is a training stability mechanism, not a distributional assumption
   about the latent space — permitted under the project's no-Gaussian policy
@@ -70,9 +75,11 @@ static appearance or average behavior.
 
 **Decoder**: convolutional network mirroring encoder
 - Input: z ∈ ℝ¹²⁸
-- Architecture: transposed convolutions mirroring encoder
-- Output: 128×128 binary grid logits (sigmoid applied for loss, argmax for
-  sampling)
+- Linear → reshape to (256, 8, 8), then 4 transposed conv layers stride-2,
+  channel progression 256→128→64→32→1
+- BatchNorm + ReLU after each transposed conv except the last
+- Output: (1, 128, 128) logits — sigmoid applied for loss, threshold at 0.5
+  for grid reconstruction
 
 **Trajectory head**: per-timestep MLP
 - Input: z_t ∈ ℝ¹²⁸ — the latent state at any step t of a rollout
@@ -162,8 +169,15 @@ identity, and the temporal ordering relationship between them.
 |------------------|------------------------------------------------------|--------------|
 | L_mechanics      | BCE(decode(f_θ^k(z_0)), grid_k) for sampled k        | 1, 2, 3      |
 | L_trajectory     | MSE(traj_head(z_k), sig_norm[k]) for k in rollout    | 2, 3         |
-| L_contrastive    | temporal triplet on z sequence                       | 3 only       |
-| VICReg           | var + cov on batch z                                 | 1, 2, 3      |
+| L_contrastive    | temporal triplet on z sequence                       | 2, 3         |
+| VICReg           | var + cov on batch z_0 (see VICReg target note)      | 1, 2, 3      |
+
+**VICReg target**: applied to z_0 vectors only (one per trajectory in the
+accumulated batch of 256). This directly regularizes the distribution that
+z_cloud represents. Mid-trajectory z_t vectors are structured by the
+contrastive loss instead. Running VICReg on trajectory frames would penalize
+the correct still-life behavior of constant z_t and conflate temporal
+correlation with feature redundancy.
 
 **Mechanics loss** uses per-cell binary cross-entropy. Ground truth is exact
 GoL simulation — no approximation. The completion criterion is >95% accuracy
@@ -178,9 +192,9 @@ throughout the trajectory: every latent state z_k must contain enough
 information to predict the observable physics at that exact moment.
 
 **Weight schedule** (approximate — tune based on validation metrics):
-- Phase 1: L_mechanics=1.0, L_trajectory=0.0, L_contrastive=0.0, VICReg=0.05
-- Phase 2: L_mechanics=1.0, L_trajectory=0.2, L_contrastive=0.0, VICReg=0.05
-- Phase 3: L_mechanics=1.0, L_trajectory=0.5, L_contrastive=0.2, VICReg=0.05
+- Phase 1: L_mechanics=1.0, L_trajectory=0.0, L_contrastive=0.0,  VICReg=0.05
+- Phase 2: L_mechanics=1.0, L_trajectory=0.2, L_contrastive=0.1,  VICReg=0.05
+- Phase 3: L_mechanics=1.0, L_trajectory=0.5, L_contrastive=0.2,  VICReg=0.05
 
 Mechanics loss never goes below 40% of total weight. If trajectory loss
 dominates early, the model learns to predict behavioral class by cheating on
@@ -188,44 +202,76 @@ grid reconstruction.
 
 ### Training curriculum
 
-**Phase 1 — Rule learning** (mechanics only, progressive rollout k = 1 → 32):
+#### Rollout depth advancement — decaying threshold
+
+k_max advances through fixed levels: 1 → 2 → 4 → 8 → 16 → 32 → 48 → 64 → 96
+→ 128 → 192 → 256. Advancement from level L to the next requires alive-cell
+accuracy on k=L to exceed the **advancement threshold** for 2 consecutive
+validation checks. The threshold decays linearly with depth but never drops
+below 95%:
+
+```
+threshold(k_max) = max(0.99 - 0.04 × (k_max / 256), 0.95)
+```
+
+Representative values:
+
+| k_max | Required accuracy |
+|-------|------------------|
+| 1     | 99.0%            |
+| 32    | 98.5%            |
+| 64    | 98.0%            |
+| 96    | 97.5%            |
+| 128   | 97.0%            |
+| 192   | 96.0%            |
+| 256   | 95.0%            |
+
+The rationale for the decay: compounding rollout errors make perfect accuracy
+physically impossible at long horizons even for a well-trained model. The
+threshold relaxes to reflect this without ever accepting reconstruction quality
+below 95% — the GoL rule is simple enough that the model should stay well above
+this floor throughout training.
+
+Phase transitions are tied to k_max milestones, not to separate criteria:
+- **Phase 1 → Phase 2**: when k_max first reaches **96**
+- **Phase 2 → Phase 3**: when k_max first reaches **192**
+
+**Phase 1 — Rule learning** (mechanics only, progressive rollout k = 1 → 96):
 - Loss: L_mechanics × 1.0 + VICReg × 0.05
 - **Teacher forcing active**: use real encoded z_t as input to f_θ (not
   predicted); prevents early error compounding before f_θ is reliable.
-- **Progressive rollout**: begin at k=1. Once alive-cell accuracy on k=1 exceeds
-  95% on validation, increase max rollout depth: 1 → 4 → 8 → 16 → 32. At each
-  step, randomly sample k ∈ [1, k_max] per training step and supervise
-  decode(f_θ^k(z_0)) against grid_k. This directly trains f_θ to compose —
-  z_0 must encode everything needed to reconstruct the grid at any depth up to
-  k_max without teacher forcing intermediate states.
+- **Progressive rollout**: begin at k_max=1. Advance through depth levels
+  (1→2→4→…→96) using the decaying threshold rule above. At each training
+  step, randomly sample k ∈ [1, k_max] and supervise decode(f_θ^k(z_0))
+  against grid_k. This directly trains f_θ to compose — z_0 must encode
+  everything needed to reconstruct the grid at any depth up to k_max without
+  teacher forcing intermediate states.
 - **Retrospective reliance**: because the decoder must reproduce grid_k from
   z_k = f_θ^k(z_0) alone, the encoder is forced to pack all mechanistically
   necessary information into z_0 at encoding time. Short-horizon errors compound
   into long-horizon failures, so the encoder cannot drop any detail that matters.
-- Do not proceed to Phase 2 until k=32 rollout drift has plateaued on
-  validation (see Rollout drift monitoring below).
 
-**Phase 2 — Trajectory supervision** (add identity, rollout k = 1 → 64,
-teacher forcing linearly decays 100% → 0%):
-- Loss: L_mechanics × 1.0 + L_trajectory × 0.2 + VICReg × 0.05
+**Phase 2 — Trajectory supervision** (add identity + contrastive, rollout
+k = 1 → 192, teacher forcing linearly decays 100% → 0%):
+- Loss: L_mechanics × 1.0 + L_trajectory × 0.2 + L_contrastive × 0.1 + VICReg × 0.05
 - **Trajectory head introduced**: at each rollout step k, apply traj_head(z_k)
   and supervise against sig_norm[k]. Loss averaged across all k steps sampled
   in the rollout.
-- Progressive rollout continues from k=32 (end of Phase 1) up to k=64.
+- Progressive rollout continues from k_max=96 (end of Phase 1) up to k_max=192,
+  using the same decaying threshold advancement rule.
   Randomly sample k ∈ [1, k_max] per training step.
 - **Gradual teacher forcing schedule**: linearly interpolate from 100% teacher
   forcing (Phase 1 end) to 0% teacher forcing (Phase 2 end) over Phase 2
-  epochs. At p_teacher probability, use real z_t; otherwise use predicted z_t.
+  training steps. At p_teacher probability, use real z_t; otherwise use
+  predicted z_t.
 - The trajectory loss provides dense behavioral signal: as k grows, the head
   must predict signal[k] from z_k derived from a free rollout — this couples
   f_θ accuracy directly to behavioral prediction quality.
-- Trigger to Phase 3: trajectory head predictions are stable at k=64 rollout
-  and teacher forcing has reached 0%.
 
 **Phase 3 — Full joint** (all losses, rollout k = 1 → 256, teacher forcing = 0%):
 - Loss: L_mechanics × 1.0 + L_trajectory × 0.5 + L_contrastive × 0.2 + VICReg × 0.05
-- Progressive rollout extends to full T=256. Randomly sample k ∈ [1, 256]
-  per training step.
+- Progressive rollout continues from k_max=192 to k_max=256 using the same
+  decaying threshold advancement rule. Randomly sample k ∈ [1, k_max] per step.
 - **Contrastive loss added at full weight**: hard negative mining enabled.
   (Hard negatives require a partially trained encoder to be meaningful —
   Phase 2 has provided this.)
@@ -271,10 +317,15 @@ Latent transition MLP: z_t ∈ ℝ¹²⁸ → z_{t+1} ∈ ℝ¹²⁸.
 
 ### `model/trajectory_head.py`
 Per-timestep trajectory prediction head: z_t ∈ ℝ¹²⁸ → ℝ¹⁰.
-- 3-layer MLP, hidden dim 128, output 10
+- 3-layer MLP, hidden dim 128, SiLU activations, output 10
 - Applied at each step t of the rollout; no recurrence, no sequence dependency
 - Output is the predicted normalized 10-signal value at timestep t
 - Loss: MSE against sig_norm[t] from `signatures_norm.npy`
+- **Training instrument only.** Forces the encoder to pack behavioral
+  information into z by providing dense per-timestep supervision. Not used
+  for novelty scoring at inference time — Stage 4 decodes z̃ to a grid,
+  re-simulates exactly using simulator.py, computes signals from exact
+  physics, and scores against sig_reference via trajectory-signature LOF.
 
 ### `model/vicreg.py`
 VICReg regularization loss (variance + covariance terms).
@@ -294,56 +345,128 @@ Temporal contrastive triplet loss with hard negative mining.
   - For each anchor i: compute pairwise distances to all j where trajectory_ids[j] ≠ trajectory_ids[i]
   - Select j with minimum distance as the hard negative
   - Return (B, 128) hard negative vectors
-- Hard negatives used in Phase 3 only; random negatives used in Phase 2
-  (hard negatives require a partially trained encoder to be meaningful)
+- **Phase 2**: random negatives (any z from a different trajectory in the batch)
+- **Phase 3**: hard negatives — the z from a different trajectory that is
+  geometrically closest to the anchor in current latent space
+- Hard negatives require a partially trained encoder to be meaningful; random
+  negatives in Phase 2 provide early structural pressure without this risk
+- Near lag k=5, far lag K=50, both fixed throughout training
 
 ### `data_loader.py`
 PyTorch Dataset and DataLoader for the Stage 1 dataset.
 - Load metadata npy files from `data/` at init (seeds, grids, signatures_norm,
-  labels, buckets, sig_mean, sig_std)
-- **On-demand simulation**: trajectories are not stored for large N_SEEDS datasets.
-  `__getitem__` calls `simulator.simulate(grid, steps=256)` to generate the
-  trajectory for the requested seed at access time. This keeps RAM usage
-  proportional to batch size, not dataset size.
-- `__getitem__` returns dict: trajectory (full (257, 128, 128) uint8),
-  sig_norm (257, 10) float32, trajectory_id, bucket
-- The training loop encodes raw grids to z vectors at each step — the
-  dataloader never calls the encoder. Returning z vectors would be wrong
-  because the encoder weights change every step during training.
-- The full trajectory is returned (from LRU cache or freshly simulated) so
-  the training loop can derive (grid_t, grid_{t+k}) pairs and index into
-  sig_norm[k] for any rollout depth k during training without calling the
-  simulator again.
-- Support 90/10 train/validation split by seed index
-- Cache recently simulated trajectories (LRU, configurable size) to avoid
-  re-simulating the same seed within a training epoch
+  labels, buckets, sig_mean, sig_std). Large arrays (grids, signatures_norm)
+  opened with mmap_mode='r' — no full load into RAM.
+- `__getitem__` returns a lightweight dict: `grid_t0` (128×128 uint8),
+  `sig_norm` (257, 10) float32, `trajectory_id` (int), `bucket` (int).
+  No simulation happens inside `__getitem__`.
+- **Batch-level simulation via collate function**: a custom collate function
+  assembles a batch from `__getitem__` results and calls
+  `simulator.simulate_batch(grids, steps=256)` once, producing
+  `(B, 257, 128, 128)` uint8 in a single vectorized pass. This amortizes
+  numpy overhead and is substantially faster than per-item simulation.
+- The training loop receives `(B, 257, 128, 128)` uint8 trajectories and
+  `(B, 257, 10)` float32 sig_norm. It encodes raw grids to z vectors at each
+  rollout step — the dataloader never calls the encoder. Returning z vectors
+  would be wrong because encoder weights change every step during training.
+- **Stratified batch sampler**: maintains one index pool per behavioral bucket
+  (dying / short / medium / long). Each batch draws proportionally from all
+  four buckets, ensuring VICReg and the contrastive loss always see behavioral
+  variety regardless of the underlying class imbalance.
+- Support 90/10 train/validation split by seed index.
+- No LRU cache — at N=1,500,000 any cache provides negligible hit rate and
+  adds complexity without benefit.
 
 ### `train_core.py`
 Training loop with 3-phase progressive rollout curriculum.
 
-Phase 1 (mechanics only, progressive rollout k=1→32, teacher forcing=100%):
+**Epoch structure**: one epoch = one complete shuffled pass over all 1,500,000
+training seeds (46,875 steps at batch_size=32). Training runs for as many
+epochs as needed until Phase 3 completion criteria are met. Validation runs
+every 500 steps. Checkpoints saved every 5,000 steps (mid-epoch) and at every
+epoch boundary.
+
+**Optimizer**: AdamW, lr=3e-4, weight_decay=1e-4. Schedule: cosine annealing
+over each phase, restarting at phase boundaries. LR floor: 1e-6. Gradient
+clipping: max_norm=1.0.
+
+**VICReg gradient accumulation**: gradient_accumulation_steps=8. VICReg loss
+computed over the accumulated z buffer (256, 128) after every 8 steps. All
+other losses update every step. This gives an effective VICReg batch of 256
+while keeping per-step simulation overhead at batch_size=32.
+
+Phase 1 (mechanics only, progressive rollout k_max=1→96, teacher forcing=100%):
 - Loss: L_mechanics × 1.0 + VICReg × 0.05
-- Rollout schedule: begin at k_max=1; advance to 4, 8, 16, 32 once alive-cell
-  accuracy on current k_max exceeds 95% on validation
+- Rollout schedule: begin at k_max=1; advance through levels
+  [1,2,4,8,16,32,48,64,96] once alive-cell accuracy at current k_max exceeds
+  threshold(k_max) for 2 consecutive validation checks
 - Randomly sample k ∈ [1, k_max] per training step
 - Teacher forcing: always use real z_t as f_θ input
+- Phase ends and Phase 2 begins when k_max first reaches 96
 
-Phase 2 (add trajectory head, progressive rollout k=1→64, teacher forcing
-100%→0%):
-- Loss: L_mechanics × 1.0 + L_trajectory × 0.2 + VICReg × 0.05
-- Continue rollout progression from k_max=32 up to k_max=64
+Phase 2 (add trajectory head, progressive rollout k_max=96→192, teacher
+forcing 100%→0%):
+- Loss: L_mechanics × 1.0 + L_trajectory × 0.2 + L_contrastive × 0.1 + VICReg × 0.05
+- Continue rollout progression from k_max=96 through [128, 192]
 - Apply traj_head(z_k) at each rollout step; supervise against sig_norm[k]
-- Teacher forcing decays linearly from 100% to 0% over Phase 2 epochs
-- Hard negatives: disabled
+- Teacher forcing decays linearly from 100% to 0% over Phase 2 training steps
+- Contrastive loss: random negatives (no hard negative mining yet)
+- Phase ends and Phase 3 begins when k_max first reaches 192
 
-Phase 3 (full joint, progressive rollout k=1→256, teacher forcing=0%):
+Phase 3 (full joint, progressive rollout k_max=192→256, teacher forcing=0%):
 - Loss: L_mechanics × 1.0 + L_trajectory × 0.5 + L_contrastive × 0.2 + VICReg × 0.05
-- Rollout extends to full T=256; randomly sample k ∈ [1, 256] per step
+- Continue rollout progression from k_max=192 to k_max=256
 - Hard negatives: enabled
 - Stop when t-SNE of encoded held-out patterns shows cluster separation
 
-Checkpointing: save model state_dict after each phase and every N epochs.
-Monitor rollout drift at each checkpoint.
+Rollout advancement threshold (all phases):
+  threshold(k_max) = max(0.99 - 0.04 × (k_max / 256), 0.95)
+2 consecutive validation checks above threshold required to advance.
+
+---
+
+## Resolved Implementation Decisions
+
+### Batch size and memory (Q1 — resolved)
+
+- **batch_size = 32** per gradient step
+- **gradient_accumulation_steps = 8** → effective VICReg batch = 256
+- VICReg loss is computed over the accumulated z buffer (256, 128) after every 8
+  steps; all other losses (mechanics, trajectory, contrastive) update every step
+- Trajectories are retained as **uint8 numpy arrays** from simulate_batch;
+  only the specific frames needed for the current rollout step (grid_0 and grid_k)
+  are converted to float32 tensors. This prevents peak RAM from scaling with T.
+- Peak RAM budget: ~134 MB for uint8 trajectory batch + float32 model activations
+  for two frames + model weights. Well within 32 GB.
+
+### DataLoader simulation strategy (Q4 — resolved)
+
+- `__getitem__` returns `(grid_t0, sig_norm, trajectory_id, bucket)` without
+  simulating. A custom **collate function** calls
+  `simulator.simulate_batch(grids, steps=256)` once per batch, producing
+  `(B, 257, 128, 128)` uint8 in a single vectorized pass.
+- No LRU cache. At N=1,500,000 any cache provides negligible hit rate.
+- Stratified batch sampler ensures each batch draws proportionally from all
+  four behavioral buckets regardless of class imbalance.
+
+### Phase advancement confidence (Q5 — resolved)
+
+- **2 consecutive validation checks** above threshold required before advancing
+  rollout depth or transitioning phases.
+
+### Optimizer, LR, schedule (Q2 — resolved)
+
+- **AdamW**, lr=3e-4, weight_decay=1e-4
+- **Cosine annealing** per phase, restarting at phase boundaries, LR floor 1e-6
+- Gradient clipping: max_norm=1.0
+
+### Epoch structure and training budget (Q3 — resolved)
+
+- Full dataset epochs: 1,500,000 seeds, 46,875 steps/epoch at batch_size=32
+- No step ceiling per phase — training continues until criteria are met
+- Validation every 500 steps; checkpoint every 5,000 steps and at epoch end
+- Rollout advancement threshold: threshold(k) = max(0.99 - 0.04×(k/256), 0.95)
+- Phase 1→2 at k_max=96; Phase 2→3 at k_max=192
 
 ---
 

@@ -8,14 +8,22 @@ process can be steered toward underexplored regions of latent space.
 
 **Inputs**:
 - Frozen Stage 2 model checkpoints (`checkpoints/`)
-- `data/grids.npy` — (N, 128, 128) uint8 training grids (for encoding to z cloud)
+- `data/grids.npy` — (N, 128, 128) uint8 training grids (for initial z cloud encoding)
 
-**Outputs**:
-- `data/z_cloud.npy` — (N, 128) float32 encoded training z vectors
-- `data/novelty_scores.npy` — (N,) float32 pre-computed LOF novelty scores
+**Outputs** (initial, from first Stage 3 run):
+- `data/z_cloud.npy` — (N, 128) float32 encoded training z vectors; grows in Stage 4
+- `data/novelty_scores.npy` — (N,) float32 pre-computed conditioning LOF scores
 - `data/z_prior.npy` — (2, 128) diagonal Gaussian fit to z cloud for inference
-- `checkpoints/lof_pipeline.pkl` — fitted PCA + LOF pipeline on z_cloud (frozen after Stage 3)
-- Denoiser checkpoint
+- `checkpoints/lof_pipeline.pkl` — fitted PCA(50) + LOF on z_cloud; updated every
+  100 discoveries in Stage 4
+- `checkpoints/denoiser.pt` — denoiser weights; retrained every 100 discoveries
+
+**Stage 4 retraining**: Stage 3 is not a one-shot stage. Every 100 confirmed
+discoveries, Stage 4 triggers a Stage 3 retrain: z_cloud has grown by 100 rows
+(one `encoder(decode(z̃))` per discovery); novelty scores are recomputed for all
+z vectors; the conditioning LOF is refit; the denoiser is retrained on the
+expanded cloud. This causes the sampler to explore progressively further from all
+previously known territory.
 
 **Files** (write in this order):
 1. `sampler/__init__.py`
@@ -55,11 +63,11 @@ L_physics  = BCE(grid_sim.float(), torch.sigmoid(grid_model))
 Weight schedule: L_denoising × 1.0 + L_physics × 0.1 initially; increase
 physics weight to 0.3 if validity rate at chosen λ_cfg drops below 85%.
 
-**Static novelty scores**: LOF scores are pre-computed once before training
-on the fixed sig_reference and remain frozen throughout denoiser training.
-Because the encoder is frozen and sig_reference is not modified until Stage 4,
-re-computing would produce identical results — the scores are stable
-conditioning inputs.
+**Conditioning novelty scores**: LOF scores are pre-computed on z_cloud before
+each denoiser training run and used as the conditioning signal `c`. On the
+initial Stage 3 run, z_cloud is fixed and scores are stable. On each Stage 4
+retrain, z_cloud has grown by 100 new discovery vectors — scores are
+recomputed for all N+100k vectors before training resumes.
 
 **Inference starting distribution**: Diffusion chain T=256 steps, matching
 the simulation horizon. At inference, the reverse chain starts from N(μ, diag(σ²))
@@ -185,12 +193,21 @@ def cosine_schedule(T, s=0.008):
 
 ---
 
-### Reference library interaction
+### Update cadence — synchronized with Stage 4
 
-`data/sig_reference.npy` starts as (N=1M, 1290) from Stage 1 and grows in
-Stage 4 as discoveries are confirmed. The LOF pipeline is re-fit periodically
-(every 100 discoveries) to incorporate new fingerprints. Between re-fits,
-Stage 4 uses the most recently saved pipeline.
+Every 100 confirmed discoveries, Stage 4 triggers the following in order:
+
+1. **Refit traj-sig LOF** on expanded `sig_reference` → save `traj_lof.pkl`
+   (Stage 4's discovery gate; handled entirely in `emergence/gate.py`)
+2. **Refit conditioning LOF** on expanded `z_cloud` → save `lof_pipeline.pkl`
+   and recompute `novelty_scores.npy` for all vectors
+3. **Retrain denoiser** on expanded `z_cloud` with updated novelty scores →
+   save `checkpoints/denoiser.pt`
+
+Steps 2 and 3 are Stage 3 responsibilities; Stage 4's `run.py` invokes
+`train_sampler.retrain()` as a subprocess after the LOF refit completes.
+Both LOF refits (traj-sig and conditioning) happen in the same pass so the
+system never operates with a stale gate and a fresh sampler or vice versa.
 
 ---
 
@@ -216,14 +233,18 @@ LOF novelty scoring pipeline.
 - `fit_z_prior(z_cloud) -> np.ndarray`
   - z_cloud: (N, 128) float32
   - Return (2, 128): row 0 = per-dim mean, row 1 = per-dim std
-- `precompute_and_save(data_dir, model_dir)`
+- `encode_and_save(data_dir, model_dir)`
   - Load frozen encoder; encode all training grids → z_cloud (N, 128)
   - Save `data/z_cloud.npy`
-  - Fit LOF pipeline on z_cloud
-  - Save `checkpoints/lof_pipeline.pkl`
-  - Compute LOF scores for all z vectors
-  - Save `data/novelty_scores.npy` (N,)
   - Fit z_prior; save `data/z_prior.npy`
+  - (Called once at initial Stage 3 setup only — encoding uses grids.npy)
+
+- `refit_and_save(z_cloud, data_dir, model_dir)`
+  - Fit PCA(50) + LOF on z_cloud (handles both initial fit and post-discovery refits)
+  - Save `checkpoints/lof_pipeline.pkl`
+  - Compute LOF scores for all z vectors in z_cloud
+  - Save `data/novelty_scores.npy` (len(z_cloud),)
+  - Called at initial Stage 3 setup and every 100 discoveries thereafter
 
 ### `sampler/denoiser.py`
 Residual MLP denoiser: (z_t, t, c) → predicted noise ε ∈ ℝ¹²⁸.
@@ -240,24 +261,42 @@ Residual MLP denoiser: (z_t, t, c) → predicted noise ε ∈ ℝ¹²⁸.
   - Run full conditioned reverse chain T→0
 
 ### `train_sampler.py`
-- Load frozen core model; load pre-computed novelty scores
+Two entry points: initial training and post-discovery retrain.
+
+`train(data_dir, model_dir, epochs)` — initial Stage 3 training:
+- Load frozen core model; load z_cloud and novelty_scores
 - For each step:
   1. Sample z from z_cloud; look up pre-computed LOF score c
   2. Sample t; add noise via forward()
   3. Predict noise conditioned on c; compute denoising MSE
   4. Compute physics consistency loss; add with weight 0.1
   5. Backpropagate; update denoiser only
-- Conditioning is always active — no dropout, no CFG
+- Save `checkpoints/denoiser.pt`
+
+`retrain(data_dir, model_dir, epochs)` — called by Stage 4 every 100 discoveries:
+- Load expanded z_cloud (now N + 100k rows) and updated novelty_scores
+- Re-initialise denoiser from last saved checkpoint (warm start, not scratch)
+- Run same training loop on expanded cloud
+- Save updated `checkpoints/denoiser.pt`
+- Warm-start prevents forgetting the geometry learned on original z_cloud;
+  the expanded cloud extends that knowledge rather than replacing it
 
 ---
 
 ## Completion Criteria
 
-- [ ] LOF pipeline fit on z_cloud (N, 128) with contamination=0.05; saved to `checkpoints/lof_pipeline.pkl`
-- [ ] `data/novelty_scores.npy` shape (N,); higher scores correspond to rarer z vectors
-- [ ] `data/z_cloud.npy` shape (N, 128)
+Initial Stage 3 run:
+- [ ] `data/z_cloud.npy` shape (N, 128); one vector per training seed
 - [ ] `data/z_prior.npy` shape (2, 128); row 1 (σ) near 1.0 per dim (VICReg effect)
-- [ ] t-SNE of z_cloud shows gliders, oscillators, still lifes in visually distinct regions (confirming LOF will separate them)
-- [ ] Denoiser training loss converges
+- [ ] Conditioning LOF fit on z_cloud; saved to `checkpoints/lof_pipeline.pkl`
+- [ ] `data/novelty_scores.npy` shape (N,); higher scores correspond to rarer z vectors
+- [ ] t-SNE of z_cloud shows gliders, oscillators, still lifes in visually distinct regions
+- [ ] Denoiser training loss converges; saved to `checkpoints/denoiser.pt`
 - [ ] Samples conditioned on high novelty score produce more novel grids than low-score conditioning
-- [ ] GoL validity rate > 80%
+- [ ] GoL validity rate > 80% at chosen lambda_cfg
+
+Post-discovery retrains (every 100 discoveries):
+- [ ] z_cloud grows by 100 rows (encoder(decode(z̃)) per discovery)
+- [ ] novelty_scores.npy recomputed for all N+100k vectors
+- [ ] lof_pipeline.pkl refit on expanded z_cloud
+- [ ] denoiser.pt warm-retrained on expanded z_cloud; validity rate remains > 80%

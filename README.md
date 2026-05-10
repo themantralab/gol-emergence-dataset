@@ -65,7 +65,16 @@ gol-emergence-dataset/
 │   ├── simulator.py               ← standalone GoL engine (B3/S23)
 │   ├── generate_data.py           ← full Stage 1 data pipeline
 │   ├── inject_gliders.py          ← glider injection utilities
-│   └── analyse_data.py            ← post-hoc analysis and figure generation
+│   ├── analyse_data.py            ← post-hoc analysis and figure generation
+│   ├── data_loader.py             ← Stage 2 PyTorch dataset + stratified sampler
+│   ├── train_core.py              ← Stage 2 training loop (progressive rollout)
+│   └── model/                     ← Stage 2 neural network modules
+│       ├── encoder.py             ← CNN encoder: 128×128 grid → 128-dim latent
+│       ├── decoder.py             ← CNN decoder: 128-dim latent → 128×128 grid
+│       ├── transition.py          ← residual MLP: z_t → z_{t+1}
+│       ├── trajectory_head.py     ← MLP: z_t → 10 behavioral signals
+│       ├── vicreg.py              ← VICReg variance+covariance regularisation
+│       └── contrastive.py         ← multiscale temporal contrastive loss
 │
 └── docs/                          ← design documentation
     ├── overarching_design.md      ← project-wide goals and architecture
@@ -149,6 +158,11 @@ Each seed produces a trajectory of shape `(257, 10)` — one row per timestep.
 Signals are stored normalized (zero mean, unit std across all seeds and timesteps).
 Use `sig_mean.npy` and `sig_std.npy` to invert.
 
+> **v1.1 note**: `sig_mean.npy`, `sig_std.npy`, `signatures_norm.npy`, and
+> `sig_reference.npy` were recomputed in May 2026 to correct normalisation statistics
+> that were calculated on the pre-stratification pool rather than the balanced dataset.
+> The raw grids and all other files are unchanged.
+
 ---
 
 ## Reproducing the Dataset
@@ -174,8 +188,8 @@ This dataset is Stage 1 of a four-stage research program.
 | Stage | Status | Description |
 |---|---|---|
 | **1 — Data Pipeline** | ✅ Complete | Generate, simulate, and characterize 1.5M GoL seeds |
-| **2 — Generative Model** | 🔜 Upcoming | Train a priorless VAE on behavioral trajectories |
-| **3 — Latent Navigation** | 🔜 Upcoming | Diffusion-based sampling over the latent space |
+| **2 — Core World Model** | 🔄 In Progress | Encoder/decoder + latent transition function with progressive rollout curriculum |
+| **3 — Latent Sampler** | 🔜 Upcoming | Diffusion-based sampling over the latent space |
 | **4 — Emergence Discovery** | 🔜 Upcoming | LOF-based novelty scoring to find unknown structures |
 
 Each stage will be published as a separate release in this repository.

@@ -82,34 +82,80 @@ Stage 4 is inference-only — no training occurs; both frozen models are consume
 
 ### Key shared artifact: z_cloud.npy
 
-`data/z_cloud.npy` is a (N_SEEDS, 128) matrix of encoded latent vectors,
-one per training seed. It is produced at the start of Stage 3 by passing all
-training grids through the frozen Stage 2 encoder. LOF density scoring against
-this matrix — via the saved `checkpoints/lof_pipeline.pkl` — is the sole
-novelty mechanism across all stages. No cluster centroids, no Gaussian distance
-assumptions.
+`data/z_cloud.npy` is a matrix of encoded latent vectors — one per known GoL
+configuration. It is **dynamic**: it starts as (N_SEEDS, 128) at the beginning
+of Stage 3, built by passing all 1.5M training grids through the frozen Stage 2
+encoder, and grows by one row per confirmed discovery throughout Stage 4.
 
-The novelty chain from raw simulation to novelty signal:
+Each confirmed discovery contributes `encoder(decode(z̃))` — the re-encoded
+grid, not z̃ directly. This guarantees every vector in z_cloud came from the
+encoder's learned manifold rather than a potentially off-manifold diffusion
+output.
+
+z_cloud serves two purposes:
+1. **Stage 3 training corpus**: the diffusion sampler learns the geometry of
+   this cloud and generates novel z̃ vectors near or beyond its boundaries.
+2. **Stage 2 completion diagnostic**: t-SNE of a held-out subset must show
+   visual cluster separation between behavioral classes before Stage 3 begins.
+
+**Update cadence** (synchronized with sig_reference LOF):
+- **Every confirmed discovery**: append `encoder(decode(z̃))` to z_cloud
+- **Every 100 discoveries**: refit the Stage 3 conditioning LOF on the
+  expanded z_cloud; retrain the Stage 3 denoiser on the expanded z_cloud
+  with updated novelty scores. This causes the sampler to explore ever
+  further from the combined known + discovered territory.
+
+z_cloud is NOT used for the Stage 4 novelty gate — that role belongs to the
+trajectory-signature LOF on sig_reference.
+
+### Novelty mechanism: trajectory-signature LOF on sig_reference
+
+Discovery is powered by the full behavioral evolution of a candidate pattern,
+not by its position in latent space. The novelty chain for a candidate z̃:
+
 ```
-simulate → grid → encoder → z ∈ ℝ¹²⁸
-                                 ↓
-               LOF (local density vs neighbours in z space)
-                                 ↓
-                     scalar novelty score
+z̃  ──decoder──▶  grid_candidate (128×128)
+                        │
+          simulator.simulate(grid_candidate, steps=256)   ← exact GoL physics
+                        │
+                (257, 128, 128) trajectory
+                        │
+          compute 10-signal array (257, 10)               ← same code as Stage 1
+                        │
+          rfft across time axis → (1290,) magnitude spectrum
+                        │
+          LOF against sig_reference.npy in full 1290D     ← no PCA
+                        │
+                  scalar novelty score
 ```
 
-`data/sig_reference.npy` is a (N_SEEDS, 1290) matrix of FFT magnitude
-fingerprints produced in Stage 1. It is retained as a behavioural archive
-for analysis and visualisation but is not part of the novelty pipeline.
+`data/sig_reference.npy` is the (N_SEEDS, 1290) behavioral archive from
+Stage 1. It is the reference corpus for novelty scoring: every training
+pattern's full temporal signature is encoded here. A candidate that evolves
+differently from all 1.5M training patterns will have a large LOF score
+in this space.
 
-Why z-cloud LOF over FFT-fingerprint LOF: the Stage 2 encoder is trained
-on trajectory dynamics with a temporal contrastive loss that explicitly
-separates behavioural classes. Gliders produce a drifting latent trajectory;
-oscillators produce a closed loop; still lifes converge to a fixed point.
-These geometric differences are directly exploited by LOF in z space. FFT
-fingerprints in contrast compress everything through a population-level PC1
-that conflates gliders and oscillators (Stage 1 finding: gliders scored as
-LOF outliers at only 5.6% vs the 5% baseline).
+**Why raw 1290D LOF on sig_reference, not z-cloud LOF:**
+
+An earlier design used LOF on z_cloud (z_0 vectors). This has a critical
+weakness: z_0 is a snapshot of the initial grid. Two patterns with similar
+initial structure but completely different long-term behavior — same z_0,
+different trajectory — would score as similar. Discovery should be powered
+by behavioral evolution, not initial appearance.
+
+The previous attempt at FFT-fingerprint LOF (Stage 1 sanity check) failed
+because PCA(50) was applied before LOF. PC1 of that reduction captured
+population level ("alive vs dead"), causing gliders and oscillators to
+collapse into the same density region. The failure was PCA, not the FFT
+fingerprints. Raw 1290D LOF on sig_reference retains the full temporal
+frequency structure of all 10 signals — including the drift signature of
+Δcx/Δcy (which is near-zero for everything except gliders) and the lag
+structure of S_lag_2/4/8/16 (which encodes oscillator period) — and
+correctly separates these classes.
+
+At inference time this is computationally tractable: one pattern at a time
+is scored against the 1.5M-point reference using sklearn LOF with a Ball
+Tree index.
 
 N_SEEDS is set via `--n-seeds` CLI arg in generate_data.py (default 10,000;
 production 1,500,000). All downstream stages read N from `data/n_seeds.npy` and
@@ -163,7 +209,7 @@ standard Python import paths so `from model.encoder import Encoder` and
 | 1 | Generate N_SEEDS dataset with 10-signal signatures (default/production 1M) | `simulator.py`, `generate_data.py` | none | `data/*.npy`, diagnostics |
 | 2 | Train encoder / transition / decoder / trajectory head via progressive rollout curriculum | `model/`, `train_core.py` | `data/` | `checkpoints/` |
 | 3 | Train novelty-conditioned denoiser on frozen z cloud | `sampler/`, `train_sampler.py` | `checkpoints/`, `sig_reference.npy` | `z_cloud.npy`, `novelty_scores.npy`, `z_prior.npy`, denoiser checkpoint |
-| 4 | Batch inference → filter → log discoveries | `emergence/` | both frozen models | `discoveries/`, updated `sig_reference.npy` |
+| 4 | Batch inference → decode → simulate → traj-sig LOF → log discoveries | `emergence/` | both frozen models | `discoveries/`, updated `sig_reference.npy` |
 
 Full specifications — architecture, function signatures, completion criteria —
 are in each stage's design document.
@@ -255,29 +301,31 @@ over 250 steps it travels ~60 cells. A 16×16 grid would cause it to hit the
 boundary immediately. The 128×128 grid gives patterns space to evolve naturally.
 The 24-cell border around the 16×16 seed acts as a buffer.
 
-### Why LOF on z cloud instead of FFT fingerprints?
+### Why trajectory-signature LOF on sig_reference instead of z-cloud LOF?
 
-The FFT fingerprint approach (computing `rfft` of the (257, 10) trajectory →
-(1290,) vector → PCA(50) → LOF) was the original design. A sanity check at
-the end of Stage 1 showed it failed at the primary goal: gliders scored as
-outliers at only 5.6%, indistinguishable from the 5% inlier baseline. PC1 of
-PCA(50) on FFT fingerprints captured population level ("alive vs dead"), causing
-gliders and oscillators to collapse into the same density region.
+Discovery must be powered by the full behavioral evolution of a pattern, not
+by a snapshot of its initial encoding. z-cloud LOF operates on z_0 — the
+encoder output for the initial grid. Two patterns with similar initial
+structure but diverging long-term behavior would score as similar under z-cloud
+LOF even if their 256-step signal trajectories are nothing alike. This is the
+wrong basis for discovery.
 
-Z-cloud LOF was chosen as the replacement because the Stage 2 encoder is
-explicitly trained, via temporal contrastive loss, to produce geometrically
-distinct trajectories for each behavioral class (glider → helix, oscillator →
-closed loop, still life → fixed point). LOF in that space correctly separates
-them.
+Trajectory-signature LOF operates on the full (257, 10) signal trajectory,
+compressed via FFT into a (1290,) fingerprint that captures the temporal
+frequency content of all 10 signals simultaneously. This is the behavioral
+fingerprint of the pattern across its entire evolution, not a snapshot.
 
-**Known tradeoffs of z-cloud LOF (accepted):**
+The earlier attempt at FFT LOF (Stage 1 sanity check) failed because PCA(50)
+was applied as a dimensionality reduction step before LOF. PC1 captured
+population level, collapsing gliders and oscillators into the same density
+region. The fix is to drop PCA entirely and run LOF in the full 1290D space.
+At 1.5M reference points, sklearn LOF with Ball Tree makes this tractable.
 
-| Tradeoff | Mitigation |
-|----------|------------|
-| Entirely dependent on Stage 2 encoder quality — if encoder fails to separate classes, novelty signal fails | Stage 2 completion gate: t-SNE of z_cloud must show visual cluster separation before Stage 3 begins |
-| "Novel in z space" may not equal "behaviorally novel" — encoder trained on training distribution may map unseen patterns near familiar ones | Temporal contrastive loss specifically trains for behavioral separation, not visual similarity |
-| z̃ from denoiser is not encoded from a grid — off-manifold z̃ may score as novel without being valid GoL | GoL validity check (Check 1) filters off-manifold z̃ before LOF gate |
-| Novelty scores unavailable until Stage 2 complete — FFT scores could have been computed at end of Stage 1 | Accepted; no mitigation needed |
+z_cloud.npy is retained because Stage 3 (diffusion sampler) needs it as
+training data — the sampler must learn the geometry of the latent space
+to generate coherent z̃ vectors. The t-SNE diagnostic also uses z_cloud to
+verify that the Stage 2 encoder has separated behavioral classes before
+Stage 3 begins. z_cloud just no longer drives novelty scoring.
 
 ### Why LOF over k-NN distance?
 
@@ -292,16 +340,16 @@ isolated point scores high. This is the correct signal for discovery.
 
 A LOF sanity check on `sig_reference` at the end of Stage 1 revealed that
 gliders score as outliers at only 5.6% — indistinguishable from the 5% inlier
-baseline. PC1 of the PCA reduction (70.8% of variance) captures population
-level rather than behavioural dynamics, causing gliders and oscillators to
-occupy the same density region in FFT space.
+baseline. PC1 of PCA(50) on FFT fingerprints captured population level ("alive
+vs dead"), causing gliders and oscillators to occupy the same density region.
 
-**Resolution**: the novelty pipeline was redesigned to use LOF on the Stage 2
-z cloud rather than FFT fingerprints. The encoder's temporal contrastive loss
-explicitly trains it to separate behavioural classes in latent space, so gliders
-and oscillators will occupy distinct z-cloud regions. LOF in z space will
-reliably score novel spaceships as outliers. No changes to Stage 1 or the
-dataset are required.
+**Resolution**: PCA is dropped entirely. LOF is run directly in the full 1290D
+FFT space against sig_reference with no dimensionality reduction. In 1290D, the
+temporal frequency structure of Δcx/Δcy (sustained drift for gliders, near-zero
+for everything else) and S_lag_2/4/8/16 (period structure of oscillators) are
+fully visible to LOF and correctly separate these classes. The failure was PCA
+compression, not the FFT representation. No changes to Stage 1 or the dataset
+are required.
 
 ---
 
@@ -316,8 +364,8 @@ dataset are required.
 | T | Number of simulation timesteps (256 for simulation; 100 for diffusion chain) |
 | 10-signal | [P, Δcx, Δcy, V, E, N_cc, S_lag_2, S_lag_4, S_lag_8, S_lag_16] trajectory signature at each timestep |
 | trajectory head | Per-timestep MLP, z_t → ℝ¹⁰; predicts normalized 10-signal values at each rollout step |
-| sig_reference | (N, 1290) FFT magnitude spectra of normalized (257,10) trajectories; behavioral archive produced in Stage 1, not used in novelty pipeline |
-| novelty score | LOF score of a query z vector against z_cloud in ℝ¹²⁸; higher = more unusual relative to neighbours |
+| sig_reference | (N, 1290) FFT magnitude spectra of normalized (257,10) trajectories; behavioral archive and novelty reference corpus for Stage 4 LOF scoring |
+| novelty score | LOF score of a candidate's (1290,) trajectory fingerprint against sig_reference in full 1290D (no PCA); higher = behaviorally more unusual |
 | GoL validity | Whether decode(z̃) → simulate 1 step ≈ decode(f_θ(z̃)) |
 | behavioral class | dying / still_life / oscillator / glider / other |
 | emergence gate | novelty score > threshold → confirmed discovery |

@@ -710,8 +710,25 @@ def main():
     # --- Normalize in-place — overwrites signatures_raw buffer ---
     # After this call signatures_raw and signatures_norm alias the same memory.
     # Peak RAM = 1× (N, 257, 10) instead of 2×.
+    # IMPORTANT: sig_mean/sig_std must be computed from the stratified data above,
+    # not from the pool. Normalizing with pool stats produces wrong z-scores on
+    # the balanced dataset (lag signals especially — pool is dying-dominated).
     signatures_norm = normalize_signatures(signatures_raw, sig_mean, sig_std)
     del signatures_raw  # drop the alias; buffer is now signatures_norm
+
+    # --- Verify normalisation is correct on a sample ---
+    _verify_sample = signatures_norm[:min(50_000, len(signatures_norm))].reshape(-1, N_SIGS)
+    _vmean = _verify_sample.mean(axis=0)
+    _vstd  = _verify_sample.std(axis=0)
+    _bad   = np.where((np.abs(_vmean) > 1.0) | (np.abs(_vstd - 1.0) > 0.5))[0]
+    if len(_bad):
+        raise RuntimeError(
+            f"Normalisation sanity check failed for signal indices {_bad.tolist()}.\n"
+            f"  mean: {_vmean.round(3)}\n  std:  {_vstd.round(3)}\n"
+            "sig_mean/sig_std were likely computed on the wrong (pre-stratification) data."
+        )
+    print(f"  Normalisation check OK — mean: {_vmean.round(2)}  std: {_vstd.round(2)}", flush=True)
+    del _verify_sample, _vmean, _vstd, _bad
 
     # --- FFT sig_reference (chunked to bound peak RAM) ---
     t0 = _phase("FFT sig_reference (chunked)")
