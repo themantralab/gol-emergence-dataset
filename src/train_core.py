@@ -55,7 +55,10 @@ LOG_EVERY    = 100     # train metrics written every N steps
 VAL_EVERY    = 500     # validation check every N steps
 CKPT_EVERY   = 5000   # checkpoint every N steps
 VAL_FRACTION = 0.1
-NUM_WORKERS  = 0
+NUM_WORKERS  = 4   # DataLoader workers for parallel simulate_batch
+TORCH_THREADS    = 4    # PyTorch threads in main process (workers get 1 each)
+ALIVE_POS_WEIGHT = 50.0 # BCE upweight for alive cells (dead:alive ratio ~378:1 in data;
+                         # natural weight ~378 is too aggressive, 50 gives ~13% gradient share)
 
 # k_max advancement levels
 K_LEVELS = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256]
@@ -139,7 +142,8 @@ def write_run_metadata(log_dir: Path, args: argparse.Namespace, run_id: str, res
             'PHASE3_K':      PHASE3_K,
             'NEAR_K':        NEAR_K,
             'FAR_K':         FAR_K,
-            'PHASE_WEIGHTS': PHASE_WEIGHTS,
+            'PHASE_WEIGHTS':    PHASE_WEIGHTS,
+            'ALIVE_POS_WEIGHT': ALIVE_POS_WEIGHT,
         },
     }
     path = log_dir / f'run_metadata_{run_id}.json'
@@ -251,12 +255,19 @@ def mechanics_loss(
 
     Decodes z_k = z_traj[:, k] and compares against the real grid at step k.
     Applied at the sampled depth only (not every step) to keep compute bounded.
+
+    pos_weight upweights alive cells to counteract the severe class imbalance
+    (~378 dead cells per alive cell). Without it, the model minimises loss by
+    predicting all-dead, producing near-zero BCE but ~0% alive-cell accuracy.
     """
     z_k      = z_traj[:, k]
     logits_k = decoder(z_k)                       # (B, 1, H, W)
     target_k = traj[:, k].float()                 # (B, H, W)
+    pw = torch.tensor([ALIVE_POS_WEIGHT], device=logits_k.device)
     return F.binary_cross_entropy_with_logits(
-        logits_k.squeeze(1), target_k, reduction='mean'
+        logits_k.squeeze(1), target_k,
+        pos_weight=pw,
+        reduction='mean',
     )
 
 
@@ -403,7 +414,22 @@ def load_checkpoint(
 # Training loop
 # ---------------------------------------------------------------------------
 
+def _worker_init_fn(worker_id: int) -> None:
+    """Limit each DataLoader worker to 1 thread so 4 workers + 4 main-process
+    threads = 8 cores total without oversubscription."""
+    torch.set_num_threads(1)
+    os.environ['OMP_NUM_THREADS']   = '1'
+    os.environ['MKL_NUM_THREADS']   = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+
 def train(args):
+    # Pin main-process torch ops to TORCH_THREADS; workers use 1 thread each
+    n_workers = args.num_workers
+    main_threads = max(1, os.cpu_count() - n_workers) if n_workers > 0 else os.cpu_count()
+    torch.set_num_threads(min(main_threads, TORCH_THREADS))
+    torch.set_num_interop_threads(2)
+
     device   = torch.device('cpu')
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -430,8 +456,10 @@ def train(args):
     train_loader, val_loader = make_loaders(
         args.data_dir,
         batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
+        num_workers=n_workers,
         val_fraction=VAL_FRACTION,
+        worker_init_fn=_worker_init_fn if n_workers > 0 else None,
+        persistent_workers=True,
     )
 
     # --- State ---
@@ -469,6 +497,7 @@ def train(args):
     train_start = time.time()
     step_start  = time.time()
 
+    print(f'Threads: main={torch.get_num_threads()} torch  workers={n_workers}×1  cores={os.cpu_count()}')
     print(f'Starting training — phase={phase}, k_max={k_max}, steps_per_epoch≈{len(train_loader)}')
     print(f'Metrics -> {ckpt_dir / "metrics.jsonl"}')
 
@@ -720,6 +749,10 @@ def main():
     parser.add_argument(
         '--phase3-steps', type=int, default=300_000,
         help='T_max for cosine annealing in Phase 3'
+    )
+    parser.add_argument(
+        '--num-workers', type=int, default=NUM_WORKERS,
+        help='DataLoader worker processes for parallel simulation (default: 4)'
     )
     args = parser.parse_args()
     train(args)

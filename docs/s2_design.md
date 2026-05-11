@@ -179,10 +179,21 @@ contrastive loss instead. Running VICReg on trajectory frames would penalize
 the correct still-life behavior of constant z_t and conflate temporal
 correlation with feature redundancy.
 
-**Mechanics loss** uses per-cell binary cross-entropy. Ground truth is exact
-GoL simulation — no approximation. The completion criterion is >95% accuracy
-on alive cells specifically (not overall accuracy, which is dominated by the
-sparse dead cells). Applied at every sampled rollout depth k — not just k=1.
+**Mechanics loss** uses per-cell binary cross-entropy with `pos_weight=50` on
+alive cells. Ground truth is exact GoL simulation — no approximation. The
+completion criterion is >95% accuracy on alive cells specifically (not overall
+accuracy, which is dominated by the sparse dead cells).
+
+The pos_weight is required because grids are ~99.74% dead cells (dead:alive
+ratio ~378:1 in the 1.5M-seed dataset). Without it the model minimises BCE by
+predicting all-dead — achieving near-zero loss and near-zero alive-cell
+accuracy simultaneously. pos_weight=50 gives alive cells ~13% of total gradient
+mass (up from 0.26%), sufficient to force the model to learn alive cell patterns
+without destabilising training. The natural weight of 378 was confirmed too
+aggressive in initial training runs (plateau at 40% alive-cell accuracy after
+20k steps with no weight).
+
+Applied at the sampled rollout depth k only — not at every step.
 
 **Trajectory loss** uses MSE between traj_head(z_k) and sig_norm[k] for each
 step k in the rollout. The target sig_norm[k] is the pre-computed normalized
