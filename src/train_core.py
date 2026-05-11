@@ -53,7 +53,7 @@ WEIGHT_DECAY = 1e-4
 GRAD_CLIP    = 1.0
 LOG_EVERY    = 100     # train metrics written every N steps
 VAL_EVERY    = 500     # validation check every N steps
-CKPT_EVERY   = 5000   # checkpoint every N steps
+CKPT_EVERY   = 1000   # checkpoint every N steps
 VAL_FRACTION = 0.1
 NUM_WORKERS  = 4   # DataLoader workers for parallel simulate_batch
 TORCH_THREADS    = 4    # PyTorch threads in main process (workers get 1 each)
@@ -414,6 +414,12 @@ def load_checkpoint(
 # Training loop
 # ---------------------------------------------------------------------------
 
+def latest_checkpoint(ckpt_dir: Path) -> Path | None:
+    """Return the highest-step checkpoint in ckpt_dir, or None if none exist."""
+    ckpts = sorted(ckpt_dir.glob('core_step*.pt'))
+    return ckpts[-1] if ckpts else None
+
+
 def _worker_init_fn(worker_id: int) -> None:
     """Limit each DataLoader worker to 1 thread so 4 workers + 4 main-process
     threads = 8 cores total without oversubscription."""
@@ -473,18 +479,24 @@ def train(args):
     phase2_start_step  = None
     phase2_total_steps = args.phase2_steps
 
-    # --- Resume ---
+    # --- Resume (explicit path, or auto-detect latest checkpoint) ---
     resume_step = None
-    if args.resume:
+    resume_path = args.resume
+    if resume_path is None and not args.fresh:
+        resume_path = latest_checkpoint(ckpt_dir)
+        if resume_path:
+            print(f'Auto-resuming from latest checkpoint: {resume_path.name}')
+
+    if resume_path:
         step, phase, k_max = load_checkpoint(
-            args.resume, encoder, decoder, transition, traj_head, optimizer, scheduler
+            resume_path, encoder, decoder, transition, traj_head, optimizer, scheduler
         )
         resume_step  = step
         k_level_idx  = K_LEVELS.index(k_max)
         p_teacher    = 0.0 if phase == 3 else 1.0
         if phase == 2:
             phase2_start_step = step
-        print(f'Resumed from {args.resume} at step={step} phase={phase} k_max={k_max}')
+        print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max}')
 
     # --- Metadata + logger ---
     run_id = f'{time.strftime("%Y%m%d_%H%M%S")}_{os.urandom(2).hex()}'
@@ -741,7 +753,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train Stage 2 Core World Model')
     parser.add_argument('--data-dir',       default='data',        help='Path to data/ directory')
     parser.add_argument('--checkpoint-dir', default='checkpoints', help='Where to save checkpoints')
-    parser.add_argument('--resume',         default=None,          help='Path to checkpoint to resume from')
+    parser.add_argument('--resume',  default=None, help='Path to specific checkpoint to resume from')
+    parser.add_argument('--fresh',   action='store_true', help='Start from scratch even if checkpoints exist')
     parser.add_argument(
         '--phase2-steps', type=int, default=200_000,
         help='Steps over which teacher forcing decays from 1.0 to 0.0 in Phase 2'
