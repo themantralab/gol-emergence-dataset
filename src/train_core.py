@@ -486,6 +486,13 @@ def train(args):
     phase2_start_step  = None
     phase2_total_steps = args.phase2_steps
 
+    # Per-task learning rates:
+    #   lr_new  — LR for steps where k == k_max (resets to LR on each k_max advance)
+    #   lr_old  — LR for steps where k < k_max (frozen at whatever LR was active when
+    #             k_max last advanced, so old tasks train at their converged rate)
+    lr_new = LR
+    lr_old = LR
+
     # --- Resume (explicit path, or auto-detect latest checkpoint) ---
     resume_step = None
     resume_path = args.resume
@@ -543,6 +550,11 @@ def train(args):
 
             # --- Sample rollout depth k ---
             k = int(torch.randint(1, k_max + 1, (1,)).item())
+
+            # --- Per-task LR: full rate for new k_max, frozen rate for old tasks ---
+            step_lr = lr_new if k == k_max else lr_old
+            for pg in optimizer.param_groups:
+                pg['lr'] = step_lr
 
             # --- Build rollout ---
             z_traj, z0 = build_rollout(encoder, transition, traj, k, p_teacher)
@@ -608,7 +620,7 @@ def train(args):
                 z0_d          = z0.detach()
                 z0_norm_mean  = z0_d.norm(dim=1).mean().item()
                 z0_std_min    = z0_d.std(dim=0).min().item()
-                lr_current    = optimizer.param_groups[0]['lr']
+                lr_current    = step_lr
 
                 record = {
                     'type':          'train',
@@ -685,8 +697,11 @@ def train(args):
                     f'thresh={thresh:.4f} above={above_thresh}/2  {bucket_str}'
                 )
 
-                # Step scheduler on val accuracy — reduces LR after patience checks
+                # Step scheduler on val accuracy — operates on lr_new only
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr_new
                 scheduler.step(acc)
+                lr_new = optimizer.param_groups[0]['lr']
 
                 if acc >= thresh:
                     above_thresh += 1
@@ -701,9 +716,18 @@ def train(args):
                         k_max       = K_LEVELS[k_level_idx]
                         print(f'  [advance] k_max {prev_k} -> {k_max}')
 
+                        # Freeze lr_old at current lr_new; give new k_max a fresh LR
+                        lr_old = lr_new
+                        lr_new = LR
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = lr_new
+                        scheduler = make_scheduler()
+                        print(f'  [lr] lr_new reset to {lr_new:.2e}  lr_old frozen at {lr_old:.2e}')
+
                         logger.log({
                             'type': 'event', 'event': 'k_max_advance', 'run_id': run_id,
                             'step': step, 'k_max_prev': prev_k, 'k_max_new': k_max,
+                            'lr_new': lr_new, 'lr_old': lr_old,
                             'wall_time_s': round(time.time() - train_start, 1),
                         })
 
