@@ -202,10 +202,17 @@ across all k steps in the rollout. This provides dense behavioral supervision
 throughout the trajectory: every latent state z_k must contain enough
 information to predict the observable physics at that exact moment.
 
-**Weight schedule** (approximate — tune based on validation metrics):
-- Phase 1: L_mechanics=1.0, L_trajectory=0.0, L_contrastive=0.0,  VICReg=0.05
+**Weight schedule**:
+- Phase 1: L_mechanics=1.0, L_trajectory=0.0, L_contrastive=0.0,  VICReg=0.01
 - Phase 2: L_mechanics=1.0, L_trajectory=0.2, L_contrastive=0.1,  VICReg=0.05
 - Phase 3: L_mechanics=1.0, L_trajectory=0.5, L_contrastive=0.2,  VICReg=0.05
+
+Phase 1 VICReg weight is 0.01 (not 0.05) to prevent VICReg from competing
+with the mechanics gradient at low LR. At 0.05, VICReg dominated mechanics
+once ReduceLROnPlateau decayed the LR, causing alive-cell accuracy regression.
+0.01 still prevents collapse while keeping mechanics as the dominant signal.
+Phases 2 and 3 restore VICReg to 0.05 as the full loss suite provides
+sufficient gradient mass.
 
 Mechanics loss never goes below 40% of total weight. If trajectory loss
 dominates early, the model learns to predict behavioral class by cheating on
@@ -394,20 +401,41 @@ Training loop with 3-phase progressive rollout curriculum.
 **Epoch structure**: one epoch = one complete shuffled pass over all 1,500,000
 training seeds (46,875 steps at batch_size=32). Training runs for as many
 epochs as needed until Phase 3 completion criteria are met. Validation runs
-every 500 steps. Checkpoints saved every 5,000 steps (mid-epoch) and at every
-epoch boundary.
+every 500 steps. Checkpoints saved every 1,000 steps.
 
-**Optimizer**: AdamW, lr=3e-4, weight_decay=1e-4. Schedule: cosine annealing
-over each phase, restarting at phase boundaries. LR floor: 1e-6. Gradient
-clipping: max_norm=1.0.
+**Resume behaviour**: on startup, automatically loads the latest checkpoint in
+`checkpoints/` if one exists. Pass `--fresh` to start from scratch regardless.
+This makes crash recovery transparent — just restart the process.
 
-**VICReg gradient accumulation**: gradient_accumulation_steps=8. VICReg loss
-computed over the accumulated z buffer (256, 128) after every 8 steps. All
-other losses update every step. This gives an effective VICReg batch of 256
-while keeping per-step simulation overhead at batch_size=32.
+**DataLoader parallelism**: `num_workers=4` worker processes each run
+`simulate_batch` independently, parallelising simulation across cores.
+Main process uses 4 PyTorch threads for model ops. Workers use 1 thread each
+(`worker_init_fn` sets `OMP_NUM_THREADS=1`). `persistent_workers=True` avoids
+worker respawn overhead between epochs.
+
+**Optimizer**: AdamW, lr=3e-4, weight_decay=1e-4. Gradient clipping: max_norm=1.0.
+
+**LR schedule — per-k independent ReduceLROnPlateau**:
+Each k level has its own `ReduceLROnPlateau(mode='min', patience=10, factor=0.5,
+min_lr=1e-5)` scheduler tracking that level's mech-loss history independently.
+
+- When k=1 stagnates (10 val intervals without improvement), k=1's LR halves.
+  k=2's LR is unaffected.
+- When k_max advances to a new level, that level starts fresh at lr=3e-4 with
+  a new scheduler. All other levels keep their independent LR and history.
+- Phase transitions reset all per-k LRs to 3e-4 and clear all scheduler state.
+
+Rationale: CosineAnnealingLR caused catastrophic regression — it cycled LR
+back to 3e-4 at step 200k, destroying learned representations. ReduceLROnPlateau
+is monotonically decreasing. Per-k independence prevents a new (harder) task
+from stalling at a low LR inherited from a completed (easier) task.
+
+**VICReg**: computed every step on the current z_0 batch (B=32). No gradient
+accumulation buffer — per-step computation on B=32 is sufficient to maintain
+variance/covariance constraints.
 
 Phase 1 (mechanics only, progressive rollout k_max=1→96, teacher forcing=100%):
-- Loss: L_mechanics × 1.0 + VICReg × 0.05
+- Loss: L_mechanics × 1.0 + VICReg × 0.01
 - Rollout schedule: begin at k_max=1; advance through levels
   [1,2,4,8,16,32,48,64,96] once alive-cell accuracy at current k_max exceeds
   threshold(k_max) for 2 consecutive validation checks
@@ -441,9 +469,8 @@ Rollout advancement threshold (all phases):
 ### Batch size and memory (Q1 — resolved)
 
 - **batch_size = 32** per gradient step
-- **gradient_accumulation_steps = 8** → effective VICReg batch = 256
-- VICReg loss is computed over the accumulated z buffer (256, 128) after every 8
-  steps; all other losses (mechanics, trajectory, contrastive) update every step
+- VICReg computed every step on B=32 z_0 vectors — no accumulation buffer.
+  Per-step B=32 is sufficient for variance/covariance constraints.
 - Trajectories are retained as **uint8 numpy arrays** from simulate_batch;
   only the specific frames needed for the current rollout step (grid_0 and grid_k)
   are converted to float32 tensors. This prevents peak RAM from scaling with T.
@@ -468,14 +495,16 @@ Rollout advancement threshold (all phases):
 ### Optimizer, LR, schedule (Q2 — resolved)
 
 - **AdamW**, lr=3e-4, weight_decay=1e-4
-- **Cosine annealing** per phase, restarting at phase boundaries, LR floor 1e-6
+- **ReduceLROnPlateau** per k level, independently. patience=10 val intervals,
+  factor=0.5, min_lr=1e-5. Resets on phase transition. New k levels start at
+  3e-4. See LR schedule section in train_core.py notes above.
 - Gradient clipping: max_norm=1.0
 
 ### Epoch structure and training budget (Q3 — resolved)
 
 - Full dataset epochs: 1,500,000 seeds, 46,875 steps/epoch at batch_size=32
 - No step ceiling per phase — training continues until criteria are met
-- Validation every 500 steps; checkpoint every 5,000 steps and at epoch end
+- Validation every 500 steps; checkpoint every 1,000 steps
 - Rollout advancement threshold: threshold(k) = max(0.99 - 0.04×(k/256), 0.95)
 - Phase 1→2 at k_max=96; Phase 2→3 at k_max=192
 
