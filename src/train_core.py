@@ -158,7 +158,7 @@ def write_run_metadata(log_dir: Path, args: argparse.Namespace, run_id: str, res
 
 def advancement_threshold(k_max: int) -> float:
     """Minimum alive-cell accuracy required to advance from k_max to next level."""
-    return max(0.99 - 0.04 * (k_max / 256), 0.95)
+    return max(0.975 - 0.04 * (k_max / 256), 0.95)
 
 
 def alive_cell_accuracy(
@@ -553,7 +553,7 @@ def train(args):
 
             # --- Teacher forcing probability ---
             if phase == 1:
-                p_teacher = 1.0
+                p_teacher = 0.9   # 10% free-rollout exposure prevents specialisation
             elif phase == 2:
                 if phase2_start_step is None:
                     phase2_start_step = step
