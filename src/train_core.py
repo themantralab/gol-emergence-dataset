@@ -73,7 +73,7 @@ FAR_K  = 50
 
 # Loss weights per phase
 PHASE_WEIGHTS = {
-    1: dict(mechanics=1.0, trajectory=0.0, contrastive=0.0, vicreg=0.05),
+    1: dict(mechanics=1.0, trajectory=0.0, contrastive=0.0, vicreg=0.01),
     2: dict(mechanics=1.0, trajectory=0.2, contrastive=0.1, vicreg=0.05),
     3: dict(mechanics=1.0, trajectory=0.5, contrastive=0.2, vicreg=0.05),
 }
@@ -461,7 +461,7 @@ def train(args):
     # goes back up. Resets at each phase transition (LR restored, fresh scheduler).
     def make_scheduler():
         return ReduceLROnPlateau(
-            optimizer, mode='max', patience=4, factor=0.5, min_lr=1e-5
+            optimizer, mode='max', patience=10, factor=0.5, min_lr=1e-5
         )
     scheduler = make_scheduler()
 
