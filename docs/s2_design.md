@@ -229,19 +229,19 @@ validation checks. The threshold decays linearly with depth but never drops
 below 95%:
 
 ```
-threshold(k_max) = max(0.99 - 0.04 × (k_max / 256), 0.95)
+threshold(k_max) = max(0.975 - 0.04 × (k_max / 256), 0.95)
 ```
 
 Representative values:
 
 | k_max | Required accuracy |
 |-------|------------------|
-| 1     | 99.0%            |
-| 32    | 98.5%            |
-| 64    | 98.0%            |
-| 96    | 97.5%            |
-| 128   | 97.0%            |
-| 192   | 96.0%            |
+| 1     | 97.5%            |
+| 32    | 97.0%            |
+| 64    | 96.5%            |
+| 96    | 96.0%            |
+| 128   | 95.5%            |
+| 192   | 95.0%            |
 | 256   | 95.0%            |
 
 The rationale for the decay: compounding rollout errors make perfect accuracy
@@ -255,9 +255,14 @@ Phase transitions are tied to k_max milestones, not to separate criteria:
 - **Phase 2 → Phase 3**: when k_max first reaches **192**
 
 **Phase 1 — Rule learning** (mechanics only, progressive rollout k = 1 → 96):
-- Loss: L_mechanics × 1.0 + VICReg × 0.05
-- **Teacher forcing active**: use real encoded z_t as input to f_θ (not
-  predicted); prevents early error compounding before f_θ is reliable.
+- Loss: L_mechanics × 1.0 + VICReg × 0.01
+- **Teacher forcing at 90%** (p_teacher=0.9): 90% of rollout steps use the
+  real encoded z_t as input to f_θ; 10% use f_θ's own predicted z_t
+  (scheduled sampling). The 10% free-rollout exposure prevents the transition
+  from over-specialising to exact encoder outputs — with TF=100%, val accuracy
+  systematically peaked at step ~500 then regressed to ~84% by step 13k as
+  the training and eval distributions diverged. 90% TF still provides strong
+  supervision for learning GoL physics while closing that gap.
 - **Progressive rollout**: begin at k_max=1. Advance through depth levels
   (1→2→4→…→96) using the decaying threshold rule above. At each training
   step, randomly sample k ∈ [1, k_max] and supervise decode(f_θ^k(z_0))
@@ -459,7 +464,7 @@ Phase 3 (full joint, progressive rollout k_max=192→256, teacher forcing=0%):
 - Stop when t-SNE of encoded held-out patterns shows cluster separation
 
 Rollout advancement threshold (all phases):
-  threshold(k_max) = max(0.99 - 0.04 × (k_max / 256), 0.95)
+  threshold(k_max) = max(0.975 - 0.04 × (k_max / 256), 0.95)
 2 consecutive validation checks above threshold required to advance.
 
 ---
