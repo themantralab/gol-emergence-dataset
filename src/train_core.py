@@ -16,7 +16,7 @@ Phase transitions are tied to k_max milestones:
 
 VICReg regularises z_0 every step (B=32 batch).
 
-Optimizer: AdamW, lr=3e-4, weight_decay=1e-4, cosine annealing per phase,
+Optimizer: AdamW, lr=3e-4, weight_decay=1e-4, ReduceLROnPlateau per phase,
            gradient clip max_norm=1.0.
 """
 
@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from model import Encoder, Decoder, Transition, TrajectoryHead
 from model.vicreg import VICReg
@@ -456,7 +456,14 @@ def train(args):
         list(traj_head.parameters())
     )
     optimizer = AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=100_000, eta_min=1e-6)
+    # ReduceLROnPlateau: halve LR after 4 consecutive val checks without
+    # improvement in alive-cell accuracy. Monotonically decreasing — never
+    # goes back up. Resets at each phase transition (LR restored, fresh scheduler).
+    def make_scheduler():
+        return ReduceLROnPlateau(
+            optimizer, mode='max', patience=4, factor=0.5, min_lr=1e-5
+        )
+    scheduler = make_scheduler()
 
     # --- Data ---
     train_loader, val_loader = make_loaders(
@@ -589,7 +596,6 @@ def train(args):
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(params, GRAD_CLIP).item()
             optimizer.step()
-            scheduler.step()
 
             # --- Step timing ---
             now        = time.time()
@@ -602,7 +608,7 @@ def train(args):
                 z0_d          = z0.detach()
                 z0_norm_mean  = z0_d.norm(dim=1).mean().item()
                 z0_std_min    = z0_d.std(dim=0).min().item()
-                lr_current    = scheduler.get_last_lr()[0]
+                lr_current    = optimizer.param_groups[0]['lr']
 
                 record = {
                     'type':          'train',
@@ -679,6 +685,9 @@ def train(args):
                     f'thresh={thresh:.4f} above={above_thresh}/2  {bucket_str}'
                 )
 
+                # Step scheduler on val accuracy — reduces LR after patience checks
+                scheduler.step(acc)
+
                 if acc >= thresh:
                     above_thresh += 1
                 else:
@@ -698,13 +707,13 @@ def train(args):
                             'wall_time_s': round(time.time() - train_start, 1),
                         })
 
-                        # Phase transitions
+                        # Phase transitions — reset LR and scheduler for new phase
                         if k_max == PHASE2_K and phase == 1:
                             phase = 2
                             phase2_start_step = step
-                            scheduler = CosineAnnealingLR(
-                                optimizer, T_max=phase2_total_steps, eta_min=1e-6
-                            )
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = LR
+                            scheduler = make_scheduler()
                             print(f'  [phase] -> Phase 2 (trajectory + contrastive random)')
                             logger.log({
                                 'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
@@ -715,9 +724,9 @@ def train(args):
                         elif k_max == PHASE3_K and phase == 2:
                             phase     = 3
                             p_teacher = 0.0
-                            scheduler = CosineAnnealingLR(
-                                optimizer, T_max=args.phase3_steps, eta_min=1e-6
-                            )
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = LR
+                            scheduler = make_scheduler()
                             print(f'  [phase] -> Phase 3 (full joint, hard negatives)')
                             logger.log({
                                 'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
@@ -758,10 +767,6 @@ def main():
     parser.add_argument(
         '--phase2-steps', type=int, default=200_000,
         help='Steps over which teacher forcing decays from 1.0 to 0.0 in Phase 2'
-    )
-    parser.add_argument(
-        '--phase3-steps', type=int, default=300_000,
-        help='T_max for cosine annealing in Phase 3'
     )
     parser.add_argument(
         '--num-workers', type=int, default=NUM_WORKERS,
