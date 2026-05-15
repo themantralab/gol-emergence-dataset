@@ -56,8 +56,8 @@ LOG_EVERY    = 100     # train metrics written every N steps
 VAL_EVERY    = 500     # validation check every N steps
 CKPT_EVERY   = 1000   # checkpoint every N steps
 VAL_FRACTION = 0.1
-NUM_WORKERS  = 4   # DataLoader workers for parallel simulate_batch
-TORCH_THREADS    = 4    # PyTorch threads in main process (workers get 1 each)
+NUM_WORKERS  = 2   # DataLoader workers for parallel simulate_batch
+TORCH_THREADS    = 6    # PyTorch threads in main process (workers get 1 each)
 ALIVE_POS_WEIGHT = 50.0 # BCE upweight for alive cells (dead:alive ratio ~378:1 in data;
                          # natural weight ~378 is too aggressive, 50 gives ~13% gradient share)
 
@@ -364,31 +364,33 @@ def validate(
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(
-    ckpt_dir:   Path,
-    encoder:    Encoder,
-    decoder:    Decoder,
-    transition: Transition,
-    traj_head:  TrajectoryHead,
-    optimizer:  torch.optim.Optimizer,
-    scheduler:  ReduceLROnPlateau,
-    lr_current: float,
-    step:       int,
-    phase:      int,
-    k_max:      int,
-    tag:        str = '',
+    ckpt_dir:          Path,
+    encoder:           Encoder,
+    decoder:           Decoder,
+    transition:        Transition,
+    traj_head:         TrajectoryHead,
+    optimizer:         torch.optim.Optimizer,
+    scheduler:         ReduceLROnPlateau,
+    lr_current:        float,
+    step:              int,
+    phase:             int,
+    k_max:             int,
+    phase2_start_step: int | None = None,
+    tag:               str = '',
 ):
     path = ckpt_dir / f'core_step{step:07d}{("_" + tag) if tag else ""}.pt'
     torch.save({
-        'step':       step,
-        'phase':      phase,
-        'k_max':      k_max,
-        'encoder':    encoder.state_dict(),
-        'decoder':    decoder.state_dict(),
-        'transition': transition.state_dict(),
-        'traj_head':  traj_head.state_dict(),
-        'optimizer':  optimizer.state_dict(),
-        'scheduler':  scheduler.state_dict(),
-        'lr_current': lr_current,
+        'step':              step,
+        'phase':             phase,
+        'k_max':             k_max,
+        'phase2_start_step': phase2_start_step,
+        'encoder':           encoder.state_dict(),
+        'decoder':           decoder.state_dict(),
+        'transition':        transition.state_dict(),
+        'traj_head':         traj_head.state_dict(),
+        'optimizer':         optimizer.state_dict(),
+        'scheduler':         scheduler.state_dict(),
+        'lr_current':        lr_current,
     }, path)
     print(f'  [ckpt] saved {path.name}')
 
@@ -401,11 +403,11 @@ def load_checkpoint(
     traj_head: TrajectoryHead,
     optimizer: torch.optim.Optimizer,
     scheduler: ReduceLROnPlateau,
-) -> tuple[int, int, int, float]:
-    """Load checkpoint. Returns (step, phase, k_max, lr_current).
+) -> tuple[int, int, int, float, int | None]:
+    """Load checkpoint. Returns (step, phase, k_max, lr_current, phase2_start_step).
 
-    Backward-compatible: old checkpoints with k_lrs/k_schedulers are silently
-    ignored and lr_current defaults to LR.
+    Backward-compatible: old checkpoints without phase2_start_step return None,
+    which the caller must handle (e.g. estimate from known Phase 2 start).
     """
     ckpt = torch.load(path, map_location='cpu')
     encoder.load_state_dict(ckpt['encoder'])
@@ -416,7 +418,8 @@ def load_checkpoint(
     if 'scheduler' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler'])
     lr_current = ckpt.get('lr_current', LR)
-    return ckpt['step'], ckpt['phase'], ckpt['k_max'], lr_current
+    phase2_start_step = ckpt.get('phase2_start_step', None)
+    return ckpt['step'], ckpt['phase'], ckpt['k_max'], lr_current, phase2_start_step
 
 
 # ---------------------------------------------------------------------------
@@ -510,18 +513,23 @@ def train(args):
             print(f'Auto-resuming from latest checkpoint: {resume_path.name}')
 
     if resume_path:
-        step, phase, k_max, lr_current = load_checkpoint(
+        step, phase, k_max, lr_current, ckpt_phase2_start = load_checkpoint(
             resume_path, encoder, decoder, transition, traj_head,
             optimizer, scheduler
         )
         for pg in optimizer.param_groups:
             pg['lr'] = lr_current
-        resume_step  = step
-        k_level_idx  = K_LEVELS.index(k_max)
-        p_teacher    = 0.0 if phase == 3 else 1.0
+        resume_step = step
+        k_level_idx = K_LEVELS.index(k_max)
+        p_teacher   = 0.0 if phase == 3 else 1.0
         if phase == 2:
-            phase2_start_step = step
-        print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max} lr={lr_current:.2e}')
+            if ckpt_phase2_start is not None:
+                phase2_start_step = ckpt_phase2_start
+            else:
+                # Old checkpoint: estimate from known Phase 2 start milestone
+                phase2_start_step = 57500
+                print(f'  [warn] phase2_start_step not in checkpoint, defaulting to {phase2_start_step}')
+        print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max} lr={lr_current:.2e} TF_start={phase2_start_step}')
 
     # --- Metadata + logger ---
     run_id = f'{time.strftime("%Y%m%d_%H%M%S")}_{os.urandom(2).hex()}'
@@ -664,7 +672,8 @@ def train(args):
             if step % CKPT_EVERY == 0:
                 save_checkpoint(
                     ckpt_dir, encoder, decoder, transition, traj_head,
-                    optimizer, scheduler, lr_current, step, phase, k_max
+                    optimizer, scheduler, lr_current, step, phase, k_max,
+                    phase2_start_step=phase2_start_step,
                 )
                 logger.log({'type': 'event', 'event': 'checkpoint', 'run_id': run_id,
                             'step': step, 'phase': phase, 'k_max': k_max,
