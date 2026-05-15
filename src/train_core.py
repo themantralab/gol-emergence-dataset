@@ -3,7 +3,7 @@ Stage 2 training loop — Core World Model.
 
 Three-phase progressive rollout curriculum:
   Phase 1: mechanics only,  k_max 1  -> 96,  teacher forcing 100%
-  Phase 2: + trajectory head + contrastive (random neg), k_max 96 -> 192, TF 100%->0%
+  Phase 2: + trajectory head + contrastive (random neg), k_max 96 -> 192, TF 90%->0%
   Phase 3: full joint + hard negatives,  k_max 192 -> 256, teacher forcing 0%
 
 k_max advances through fixed levels when alive-cell accuracy at current k_max
@@ -16,8 +16,9 @@ Phase transitions are tied to k_max milestones:
 
 VICReg regularises z_0 every step (B=32 batch).
 
-Optimizer: AdamW, lr=3e-4, weight_decay=1e-4, ReduceLROnPlateau per phase,
-           gradient clip max_norm=1.0.
+Optimizer: AdamW, lr=3e-4, weight_decay=1e-4, single ReduceLROnPlateau(mode='max',
+           patience=10, factor=0.5, min_lr=1e-5) stepping on val accuracy, reset on
+           k_max advance and phase transitions. Gradient clip max_norm=1.0.
 """
 
 import argparse
@@ -363,57 +364,59 @@ def validate(
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(
-    ckpt_dir:     Path,
-    encoder:      Encoder,
-    decoder:      Decoder,
-    transition:   Transition,
-    traj_head:    TrajectoryHead,
-    optimizer:    torch.optim.Optimizer,
-    k_lrs:        dict,
-    k_schedulers: dict,
-    step:         int,
-    phase:        int,
-    k_max:        int,
-    tag:          str = '',
+    ckpt_dir:   Path,
+    encoder:    Encoder,
+    decoder:    Decoder,
+    transition: Transition,
+    traj_head:  TrajectoryHead,
+    optimizer:  torch.optim.Optimizer,
+    scheduler:  ReduceLROnPlateau,
+    lr_current: float,
+    step:       int,
+    phase:      int,
+    k_max:      int,
+    tag:        str = '',
 ):
     path = ckpt_dir / f'core_step{step:07d}{("_" + tag) if tag else ""}.pt'
     torch.save({
-        'step':         step,
-        'phase':        phase,
-        'k_max':        k_max,
-        'encoder':      encoder.state_dict(),
-        'decoder':      decoder.state_dict(),
-        'transition':   transition.state_dict(),
-        'traj_head':    traj_head.state_dict(),
-        'optimizer':    optimizer.state_dict(),
-        'k_lrs':        dict(k_lrs),
-        'k_schedulers': {k: s.state_dict() for k, s in k_schedulers.items()},
+        'step':       step,
+        'phase':      phase,
+        'k_max':      k_max,
+        'encoder':    encoder.state_dict(),
+        'decoder':    decoder.state_dict(),
+        'transition': transition.state_dict(),
+        'traj_head':  traj_head.state_dict(),
+        'optimizer':  optimizer.state_dict(),
+        'scheduler':  scheduler.state_dict(),
+        'lr_current': lr_current,
     }, path)
     print(f'  [ckpt] saved {path.name}')
 
 
 def load_checkpoint(
-    path:         str,
-    encoder:      Encoder,
-    decoder:      Decoder,
-    transition:   Transition,
-    traj_head:    TrajectoryHead,
-    optimizer:    torch.optim.Optimizer,
-    k_lrs:        dict,
-    k_schedulers: dict,
-) -> tuple[int, int, int]:
-    """Load checkpoint. Returns (step, phase, k_max)."""
+    path:      str,
+    encoder:   Encoder,
+    decoder:   Decoder,
+    transition: Transition,
+    traj_head: TrajectoryHead,
+    optimizer: torch.optim.Optimizer,
+    scheduler: ReduceLROnPlateau,
+) -> tuple[int, int, int, float]:
+    """Load checkpoint. Returns (step, phase, k_max, lr_current).
+
+    Backward-compatible: old checkpoints with k_lrs/k_schedulers are silently
+    ignored and lr_current defaults to LR.
+    """
     ckpt = torch.load(path, map_location='cpu')
     encoder.load_state_dict(ckpt['encoder'])
     decoder.load_state_dict(ckpt['decoder'])
     transition.load_state_dict(ckpt['transition'])
     traj_head.load_state_dict(ckpt['traj_head'])
     optimizer.load_state_dict(ckpt['optimizer'])
-    k_lrs.update(ckpt.get('k_lrs', {}))
-    for k, sd in ckpt.get('k_schedulers', {}).items():
-        if k in k_schedulers:
-            k_schedulers[k].load_state_dict(sd)
-    return ckpt['step'], ckpt['phase'], ckpt['k_max']
+    if 'scheduler' in ckpt:
+        scheduler.load_state_dict(ckpt['scheduler'])
+    lr_current = ckpt.get('lr_current', LR)
+    return ckpt['step'], ckpt['phase'], ckpt['k_max'], lr_current
 
 
 # ---------------------------------------------------------------------------
@@ -463,26 +466,18 @@ def train(args):
     )
     optimizer = AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # --- Per-k learning rate management ---
-    # Each k level has its own LR and ReduceLROnPlateau scheduler tracking its
-    # own mech-loss EMA. When k stagnates (loss plateaus), only that k's LR
-    # reduces. New k levels always start at full LR. Phase transitions reset all.
-    k_lrs:        dict[int, float]              = {}
-    k_schedulers: dict[int, ReduceLROnPlateau]  = {}
-    k_loss_buf:   dict[int, list[float]]        = {}
+    # --- Learning rate management ---
+    # Single ReduceLROnPlateau steps on val accuracy (mode='max').
+    # Reset to full LR on k_max advance and phase transitions so each new
+    # curriculum stage starts fresh without carrying a depleted LR.
+    lr_current = LR
 
-    def init_k_lr(k: int) -> None:
-        k_lrs[k]      = LR
-        k_schedulers[k] = ReduceLROnPlateau(
-            optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-5
+    def make_scheduler() -> ReduceLROnPlateau:
+        return ReduceLROnPlateau(
+            optimizer, mode='max', patience=10, factor=0.5, min_lr=1e-5
         )
-        k_loss_buf[k] = []
 
-    def reset_all_k_lrs() -> None:
-        for k in list(k_lrs.keys()):
-            init_k_lr(k)
-
-    init_k_lr(K_LEVELS[0])
+    scheduler = make_scheduler()
 
     # --- Data ---
     train_loader, val_loader = make_loaders(
@@ -515,16 +510,18 @@ def train(args):
             print(f'Auto-resuming from latest checkpoint: {resume_path.name}')
 
     if resume_path:
-        step, phase, k_max = load_checkpoint(
+        step, phase, k_max, lr_current = load_checkpoint(
             resume_path, encoder, decoder, transition, traj_head,
-            optimizer, k_lrs, k_schedulers
+            optimizer, scheduler
         )
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr_current
         resume_step  = step
         k_level_idx  = K_LEVELS.index(k_max)
         p_teacher    = 0.0 if phase == 3 else 1.0
         if phase == 2:
             phase2_start_step = step
-        print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max}')
+        print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max} lr={lr_current:.2e}')
 
     # --- Metadata + logger ---
     run_id = f'{time.strftime("%Y%m%d_%H%M%S")}_{os.urandom(2).hex()}'
@@ -558,21 +555,12 @@ def train(args):
                 if phase2_start_step is None:
                     phase2_start_step = step
                 frac = min(1.0, (step - phase2_start_step) / max(1, phase2_total_steps))
-                p_teacher = 1.0 - frac
+                p_teacher = 0.9 * (1.0 - frac)
             else:
                 p_teacher = 0.0
 
             # --- Sample rollout depth k ---
             k = int(torch.randint(1, k_max + 1, (1,)).item())
-
-            # Ensure this k level has an LR entry (handles first encounter)
-            if k not in k_lrs:
-                init_k_lr(k)
-
-            # Set optimizer LR to this k's independent rate
-            step_lr = k_lrs[k]
-            for pg in optimizer.param_groups:
-                pg['lr'] = step_lr
 
             # --- Build rollout ---
             z_traj, z0 = build_rollout(encoder, transition, traj, k, p_teacher)
@@ -627,9 +615,6 @@ def train(args):
             grad_norm = nn.utils.clip_grad_norm_(params, GRAD_CLIP).item()
             optimizer.step()
 
-            # Buffer mech loss for this k's independent scheduler
-            k_loss_buf[k].append(loss_mech.item())
-
             # --- Step timing ---
             now        = time.time()
             step_time  = now - step_start
@@ -638,10 +623,9 @@ def train(args):
 
             # --- Logging ---
             if step % LOG_EVERY == 0:
-                z0_d          = z0.detach()
-                z0_norm_mean  = z0_d.norm(dim=1).mean().item()
-                z0_std_min    = z0_d.std(dim=0).min().item()
-                lr_current    = step_lr
+                z0_d         = z0.detach()
+                z0_norm_mean = z0_d.norm(dim=1).mean().item()
+                z0_std_min   = z0_d.std(dim=0).min().item()
 
                 record = {
                     'type':          'train',
@@ -680,7 +664,7 @@ def train(args):
             if step % CKPT_EVERY == 0:
                 save_checkpoint(
                     ckpt_dir, encoder, decoder, transition, traj_head,
-                    optimizer, k_lrs, k_schedulers, step, phase, k_max
+                    optimizer, scheduler, lr_current, step, phase, k_max
                 )
                 logger.log({'type': 'event', 'event': 'checkpoint', 'run_id': run_id,
                             'step': step, 'phase': phase, 'k_max': k_max,
@@ -718,15 +702,11 @@ def train(args):
                     f'thresh={thresh:.4f} above={above_thresh}/2  {bucket_str}'
                 )
 
-                # Step each k level's scheduler independently using its mech-loss buffer
-                for k_level, buf in k_loss_buf.items():
-                    if buf:
-                        avg_loss = float(np.mean(buf))
-                        for pg in optimizer.param_groups:
-                            pg['lr'] = k_lrs[k_level]
-                        k_schedulers[k_level].step(avg_loss)
-                        k_lrs[k_level] = optimizer.param_groups[0]['lr']
-                        buf.clear()
+                # Step scheduler on val accuracy; reduce LR if no improvement
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr_current
+                scheduler.step(acc)
+                lr_current = optimizer.param_groups[0]['lr']
 
                 if acc >= thresh:
                     above_thresh += 1
@@ -741,15 +721,17 @@ def train(args):
                         k_max       = K_LEVELS[k_level_idx]
                         print(f'  [advance] k_max {prev_k} -> {k_max}')
 
-                        # New k level gets fresh LR; all other k levels keep their own
-                        init_k_lr(k_max)
-                        print(f'  [lr] k={k_max} initialised at {LR:.2e}  '
-                              f'existing: { {kk: f"{v:.2e}" for kk,v in k_lrs.items() if kk!=k_max} }')
+                        # Reset LR and scheduler on each k_max advance
+                        lr_current = LR
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = lr_current
+                        scheduler = make_scheduler()
+                        print(f'  [lr] reset to {LR:.2e} at k_max={k_max}')
 
                         logger.log({
                             'type': 'event', 'event': 'k_max_advance', 'run_id': run_id,
                             'step': step, 'k_max_prev': prev_k, 'k_max_new': k_max,
-                            'k_lrs': {str(kk): round(v, 8) for kk, v in k_lrs.items()},
+                            'lr_new': LR,
                             'wall_time_s': round(time.time() - train_start, 1),
                         })
 
@@ -757,7 +739,10 @@ def train(args):
                         if k_max == PHASE2_K and phase == 1:
                             phase = 2
                             phase2_start_step = step
-                            reset_all_k_lrs()
+                            lr_current = LR
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = lr_current
+                            scheduler = make_scheduler()
                             print(f'  [phase] -> Phase 2 (trajectory + contrastive random)')
                             logger.log({
                                 'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
@@ -768,7 +753,10 @@ def train(args):
                         elif k_max == PHASE3_K and phase == 2:
                             phase     = 3
                             p_teacher = 0.0
-                            reset_all_k_lrs()
+                            lr_current = LR
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = lr_current
+                            scheduler = make_scheduler()
                             print(f'  [phase] -> Phase 3 (full joint, hard negatives)')
                             logger.log({
                                 'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
@@ -807,8 +795,8 @@ def main():
     parser.add_argument('--resume',  default=None, help='Path to specific checkpoint to resume from')
     parser.add_argument('--fresh',   action='store_true', help='Start from scratch even if checkpoints exist')
     parser.add_argument(
-        '--phase2-steps', type=int, default=200_000,
-        help='Steps over which teacher forcing decays from 1.0 to 0.0 in Phase 2'
+        '--phase2-steps', type=int, default=100_000,
+        help='Steps over which teacher forcing decays from 0.9 to 0.0 in Phase 2'
     )
     parser.add_argument(
         '--num-workers', type=int, default=NUM_WORKERS,
