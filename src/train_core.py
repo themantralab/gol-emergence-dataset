@@ -730,12 +730,14 @@ def train(args):
                         k_max       = K_LEVELS[k_level_idx]
                         print(f'  [advance] k_max {prev_k} -> {k_max}')
 
-                        # Reset LR and scheduler on each k_max advance
+                        # Reset LR, scheduler, and TF on each k_max advance
                         lr_current = LR
                         for pg in optimizer.param_groups:
                             pg['lr'] = lr_current
                         scheduler = make_scheduler()
-                        print(f'  [lr] reset to {LR:.2e} at k_max={k_max}')
+                        if phase == 2:
+                            phase2_start_step = step
+                        print(f'  [lr+TF] reset at k_max={k_max}  lr={LR:.2e}  TF->0.9')
 
                         logger.log({
                             'type': 'event', 'event': 'k_max_advance', 'run_id': run_id,
