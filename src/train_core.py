@@ -711,11 +711,14 @@ def train(args):
                     f'thresh={thresh:.4f} above={above_thresh}/2  {bucket_str}'
                 )
 
-                # Step scheduler on val accuracy; reduce LR if no improvement
-                for pg in optimizer.param_groups:
-                    pg['lr'] = lr_current
-                scheduler.step(acc)
-                lr_current = optimizer.param_groups[0]['lr']
+                # Step scheduler only in Phase 3 (TF=0, val acc is stable signal).
+                # During Phase 2 TF decay, val acc oscillates structurally and
+                # would cause premature LR reductions unrelated to real plateaus.
+                if phase == 3:
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = lr_current
+                    scheduler.step(acc)
+                    lr_current = optimizer.param_groups[0]['lr']
 
                 if acc >= thresh:
                     above_thresh += 1
