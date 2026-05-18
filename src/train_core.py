@@ -714,6 +714,12 @@ def train(args):
                 val_time = time.time() - val_start
                 thresh   = advancement_threshold(k_max, phase)
 
+                # Compute rolling average before logging/printing
+                val_acc_buf.append(acc)
+                if len(val_acc_buf) > 3:
+                    val_acc_buf.pop(0)
+                smooth_acc = float(np.mean(val_acc_buf))
+
                 val_record = {
                     'type':          'val',
                     'run_id':        run_id,
@@ -746,12 +752,6 @@ def train(args):
                         pg['lr'] = lr_current
                     scheduler.step(acc)
                     lr_current = optimizer.param_groups[0]['lr']
-
-                # Use rolling average of last 3 val checks to reduce noise
-                val_acc_buf.append(acc)
-                if len(val_acc_buf) > 3:
-                    val_acc_buf.pop(0)
-                smooth_acc = float(np.mean(val_acc_buf))
 
                 if smooth_acc >= thresh:
                     above_thresh += 1
