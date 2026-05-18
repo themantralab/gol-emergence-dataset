@@ -176,9 +176,14 @@ def write_run_metadata(log_dir: Path, args: argparse.Namespace, run_id: str, res
 # Helpers
 # ---------------------------------------------------------------------------
 
-def advancement_threshold(k_max: int) -> float:
+def advancement_threshold(k_max: int, phase: int) -> float:
     """Minimum alive-cell accuracy required to advance from k_max to next level."""
-    return max(0.975 - 0.04 * (k_max / 256), 0.95)
+    if phase == 1:
+        return max(0.95 - 0.04 * (k_max / 256), 0.90)
+    elif phase == 2:
+        return max(0.85 - 0.04 * (k_max / 256), 0.80)
+    else:
+        return max(0.90 - 0.04 * (k_max / 256), 0.85)
 
 
 def alive_cell_accuracy(
@@ -518,6 +523,7 @@ def train(args):
     k_level_idx  = 0
     above_thresh = 0
     p_teacher    = 1.0
+    val_acc_buf: list[float] = []   # rolling window for advancement decisions
 
     phase2_start_step  = None
     phase2_total_steps = args.phase2_steps
@@ -706,7 +712,7 @@ def train(args):
                     encoder, decoder, transition, val_loader, k_max, device
                 )
                 val_time = time.time() - val_start
-                thresh   = advancement_threshold(k_max)
+                thresh   = advancement_threshold(k_max, phase)
 
                 val_record = {
                     'type':          'val',
@@ -717,6 +723,7 @@ def train(args):
                     'val_acc':       round(acc,      4),
                     'threshold':     round(thresh,   4),
                     'above_thresh':  above_thresh,
+                    'smooth_acc':    round(float(np.mean(val_acc_buf)) if val_acc_buf else acc, 4),
                     'bucket_acc':    {str(b): round(v, 4) for b, v in sorted(bucket_acc.items())},
                     'val_time_s':    round(val_time, 2),
                     'wall_time_s':   round(time.time() - train_start, 1),
@@ -727,7 +734,7 @@ def train(args):
                     f'b{b}={v:.4f}' for b, v in sorted(bucket_acc.items())
                 )
                 print(
-                    f'  [val] step={step} k_max={k_max} acc={acc:.4f} '
+                    f'  [val] step={step} k_max={k_max} acc={acc:.4f} smooth={smooth_acc:.4f} '
                     f'thresh={thresh:.4f} above={above_thresh}/2  {bucket_str}'
                 )
 
@@ -740,7 +747,13 @@ def train(args):
                     scheduler.step(acc)
                     lr_current = optimizer.param_groups[0]['lr']
 
-                if acc >= thresh:
+                # Use rolling average of last 3 val checks to reduce noise
+                val_acc_buf.append(acc)
+                if len(val_acc_buf) > 3:
+                    val_acc_buf.pop(0)
+                smooth_acc = float(np.mean(val_acc_buf))
+
+                if smooth_acc >= thresh:
                     above_thresh += 1
                 else:
                     above_thresh = 0
@@ -752,6 +765,7 @@ def train(args):
                         k_level_idx += 1
                         k_max       = K_LEVELS[k_level_idx]
                         print(f'  [advance] k_max {prev_k} -> {k_max}')
+                        val_acc_buf.clear()
 
                         # Reset LR, scheduler, and TF on each k_max advance
                         lr_current = LR
