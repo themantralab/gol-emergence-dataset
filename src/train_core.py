@@ -482,7 +482,7 @@ def train(args):
     transition = Transition(LATENT_DIM, hidden_dim=LATENT_DIM * 2).to(device)
     traj_head  = TrajectoryHead(LATENT_DIM, hidden_dim=LATENT_DIM).to(device)
 
-    vicreg      = VICReg(LATENT_DIM).to(device)
+    vicreg      = VICReg(LATENT_DIM, lambda_var=5.0, lambda_cov=0.0).to(device)
     contrastive = TemporalContrastiveLoss(near_k=NEAR_K, far_K=FAR_K)
 
     params = (
