@@ -48,7 +48,7 @@ import simulator
 # Constants
 # ---------------------------------------------------------------------------
 
-LATENT_DIM   = 128
+LATENT_DIM   = 256
 BATCH_SIZE   = 32
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
@@ -479,8 +479,8 @@ def train(args):
     # --- Models ---
     encoder    = Encoder(LATENT_DIM).to(device)
     decoder    = Decoder(LATENT_DIM).to(device)
-    transition = Transition(LATENT_DIM).to(device)
-    traj_head  = TrajectoryHead(LATENT_DIM).to(device)
+    transition = Transition(LATENT_DIM, hidden_dim=LATENT_DIM * 2).to(device)
+    traj_head  = TrajectoryHead(LATENT_DIM, hidden_dim=LATENT_DIM).to(device)
 
     vicreg      = VICReg(LATENT_DIM).to(device)
     contrastive = TemporalContrastiveLoss(near_k=NEAR_K, far_K=FAR_K)
