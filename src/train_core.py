@@ -3,7 +3,8 @@ Stage 2 training loop — Core World Model.
 
 Three-phase progressive rollout curriculum:
   Phase 1: mechanics only,  k_max 1  -> 96,  teacher forcing 100%
-  Phase 2: + trajectory head + contrastive (random neg), k_max 96 -> 192, TF 90%->0%
+  Phase 2: + trajectory head + contrastive (random neg), k_max 96 -> 192, TF 90%->0%,
+           auxiliary losses ramped from 0 to full weight over PHASE2_RAMP_STEPS (30k steps)
   Phase 3: full joint + hard negatives,  k_max 192 -> 256, teacher forcing 0%
 
 k_max advances through fixed levels when alive-cell accuracy at current k_max
@@ -72,12 +73,30 @@ PHASE3_K = 192
 NEAR_K = 5
 FAR_K  = 50
 
-# Loss weights per phase
+# Loss weights per phase (Phase 2 target weights — ramped in gradually)
 PHASE_WEIGHTS = {
     1: dict(mechanics=1.0, trajectory=0.0, contrastive=0.0, vicreg=0.01),
     2: dict(mechanics=1.0, trajectory=0.2, contrastive=0.1, vicreg=0.05),
     3: dict(mechanics=1.0, trajectory=0.5, contrastive=0.2, vicreg=0.05),
 }
+
+# Steps to linearly ramp Phase 2 auxiliary losses from 0 to full weight.
+# Prevents gradient conflict from hitting the encoder all at once at phase entry.
+PHASE2_RAMP_STEPS = 30_000
+
+
+def get_loss_weights(phase: int, step: int, phase2_start_step: int | None) -> dict:
+    """Return loss weights, with Phase 2 auxiliary losses ramped in gradually."""
+    if phase != 2 or phase2_start_step is None:
+        return PHASE_WEIGHTS[phase]
+    frac = min(1.0, (step - phase2_start_step) / max(1, PHASE2_RAMP_STEPS))
+    w1, w2 = PHASE_WEIGHTS[1], PHASE_WEIGHTS[2]
+    return dict(
+        mechanics=w2['mechanics'],
+        trajectory=w2['trajectory']  * frac,
+        contrastive=w2['contrastive'] * frac,
+        vicreg=w1['vicreg'] + (w2['vicreg'] - w1['vicreg']) * frac,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +593,7 @@ def train(args):
             z_traj, z0 = build_rollout(encoder, transition, traj, k, p_teacher)
 
             # --- Losses ---
-            w = PHASE_WEIGHTS[phase]
+            w = get_loss_weights(phase, step, phase2_start_step)
 
             loss_mech = mechanics_loss(decoder, z_traj, traj, k)
             loss = w['mechanics'] * loss_mech
@@ -643,6 +662,7 @@ def train(args):
                     'k_max':         k_max,
                     'k':             k,
                     'p_teacher':     round(p_teacher, 4),
+                    'p2_ramp':       round(min(1.0, (step - phase2_start_step) / max(1, PHASE2_RAMP_STEPS)), 4) if phase == 2 and phase2_start_step else None,
                     'loss_total':    round(loss_val,               4),
                     'loss_mech':     round(loss_mech.item(),       4),
                     'loss_traj':     round(loss_traj_val,    4) if loss_traj_val    is not None else None,
