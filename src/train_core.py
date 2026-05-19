@@ -799,18 +799,29 @@ def train(args):
                             })
 
                         elif k_max == PHASE3_K and phase == 2:
-                            phase     = 3
-                            p_teacher = 0.0
-                            lr_current = LR
-                            for pg in optimizer.param_groups:
-                                pg['lr'] = lr_current
-                            scheduler = make_scheduler()
-                            print(f'  [phase] -> Phase 3 (full joint, hard negatives)')
-                            logger.log({
-                                'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
-                                'step': step, 'from_phase': 2, 'to_phase': 3, 'k_max': k_max,
-                                'wall_time_s': round(time.time() - train_start, 1),
-                            })
+                            ramp_done = (phase2_start_step is None or
+                                         step >= phase2_start_step + PHASE2_RAMP_STEPS)
+                            if not ramp_done:
+                                ramp_pct = round(100 * (step - phase2_start_step) / PHASE2_RAMP_STEPS, 1)
+                                print(f'  [phase] k_max=192 reached but Phase 2 ramp only {ramp_pct}% complete — staying in Phase 2')
+                                logger.log({
+                                    'type': 'event', 'event': 'phase3_gated', 'run_id': run_id,
+                                    'step': step, 'ramp_pct': ramp_pct,
+                                    'wall_time_s': round(time.time() - train_start, 1),
+                                })
+                            else:
+                                phase     = 3
+                                p_teacher = 0.0
+                                lr_current = LR
+                                for pg in optimizer.param_groups:
+                                    pg['lr'] = lr_current
+                                scheduler = make_scheduler()
+                                print(f'  [phase] -> Phase 3 (full joint, hard negatives)')
+                                logger.log({
+                                    'type': 'event', 'event': 'phase_transition', 'run_id': run_id,
+                                    'step': step, 'from_phase': 2, 'to_phase': 3, 'k_max': k_max,
+                                    'wall_time_s': round(time.time() - train_start, 1),
+                                })
 
                     else:
                         print(f'  [complete] k_max={k_max} reached 256 with acc={acc:.4f}')
