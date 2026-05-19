@@ -82,7 +82,7 @@ PHASE_WEIGHTS = {
 
 # Steps to linearly ramp Phase 2 auxiliary losses from 0 to full weight.
 # Prevents gradient conflict from hitting the encoder all at once at phase entry.
-PHASE2_RAMP_STEPS = 30_000
+PHASE2_RAMP_STEPS = 10_000
 
 
 def get_loss_weights(phase: int, step: int, phase2_start_step: int | None) -> dict:
@@ -525,7 +525,8 @@ def train(args):
     p_teacher    = 1.0
     val_acc_buf: list[float] = []   # rolling window for advancement decisions
 
-    phase2_start_step  = None
+    phase2_start_step  = None   # resets on k_max advance (drives TF decay + ramp)
+    phase2_entry_step  = None   # fixed at Phase 2 entry (drives Phase 3 gate)
     phase2_total_steps = args.phase2_steps
 
 
@@ -550,10 +551,11 @@ def train(args):
         if phase == 2:
             if ckpt_phase2_start is not None:
                 phase2_start_step = ckpt_phase2_start
+                phase2_entry_step = ckpt_phase2_start
             else:
-                # Old checkpoint: estimate from known Phase 2 start milestone
-                phase2_start_step = 57500
-                print(f'  [warn] phase2_start_step not in checkpoint, defaulting to {phase2_start_step}')
+                phase2_start_step = step
+                phase2_entry_step = step
+                print(f'  [warn] phase2_start_step not in checkpoint, defaulting to {step}')
         print(f'Resumed from {resume_path} at step={step} phase={phase} k_max={k_max} lr={lr_current:.2e} TF_start={phase2_start_step}')
 
     # --- Metadata + logger ---
@@ -787,6 +789,7 @@ def train(args):
                         if k_max == PHASE2_K and phase == 1:
                             phase = 2
                             phase2_start_step = step
+                            phase2_entry_step = step
                             lr_current = LR
                             for pg in optimizer.param_groups:
                                 pg['lr'] = lr_current
@@ -799,10 +802,10 @@ def train(args):
                             })
 
                         elif k_max == PHASE3_K and phase == 2:
-                            ramp_done = (phase2_start_step is None or
-                                         step >= phase2_start_step + PHASE2_RAMP_STEPS)
+                            ramp_done = (phase2_entry_step is None or
+                                         step >= phase2_entry_step + PHASE2_RAMP_STEPS)
                             if not ramp_done:
-                                ramp_pct = round(100 * (step - phase2_start_step) / PHASE2_RAMP_STEPS, 1)
+                                ramp_pct = round(100 * (step - phase2_entry_step) / PHASE2_RAMP_STEPS, 1)
                                 print(f'  [phase] k_max=192 reached but Phase 2 ramp only {ramp_pct}% complete — staying in Phase 2')
                                 logger.log({
                                     'type': 'event', 'event': 'phase3_gated', 'run_id': run_id,
